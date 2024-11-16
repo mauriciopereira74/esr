@@ -1,3 +1,4 @@
+# pylint: disable=broad-exception-caught
 import socket
 import sys
 import json
@@ -39,6 +40,7 @@ nodes = {
 streams = []
 
 nodes_connected = []
+
 
 def find_ip(addr):
     for node, interfaces in nodes.items():
@@ -91,23 +93,15 @@ def start_bootstrapper(host='0.0.0.0', port=5001):
 def server_con(server_host, server_port):
     # Create a socket object
     client_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    try:
-        # Connect to the server
-        client_socket.connect((server_host, server_port))
-        logging.info(f"Connected to server at {server_host}:{server_port}")
+    # Connect to the server
+    client_socket.connect((server_host, server_port))
+    logging.info(f"Connected to server at {server_host}:{server_port}")
 
-        # Send request for available streams
-        client_socket.send(b'0')
-
-        # Receive response from the server
-        response = client_socket.recv(1024).decode()
-        logging.info(f"Available streams: {response}")
-        streams.extend(response.split(","))
-    except Exception as e:
-        logging.error(f"Error connecting to server: {e}")
-    finally:
-        client_socket.close()
-
+    response = client_socket.recv(1024).decode()
+    logging.info(f"Available streams: {response}")
+    streams.extend(response.split(","))
+    response = client_socket.recv(1024).decode()
+   
 if __name__ == "__main__":
     if len(sys.argv) != 5:
         print("Usage: python name.py <BOOTSTRAPPER_IP> <BOOTSTRAPPER_PORT> <SERVER_IP> <SERVER_PORT>")

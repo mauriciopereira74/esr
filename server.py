@@ -1,3 +1,4 @@
+# pylint: disable=invalid-name
 import socket
 import subprocess
 import threading
@@ -36,25 +37,16 @@ def stream_video(file, ip, port):
     subprocess.run(ffmpeg_command)
 
 def handle_client_connection(conn, addr):
-    try:
-        # Recebe a solicitação do cliente
-        request = conn.recv(1024).decode()
-        logging.info(f"Request received from {addr}: {request}")
+    # Recebe a solicitação do cliente
+    request = conn.recv(1024).decode()
+    logging.info(f"Request received from {addr}: {request}")
 
-        if request == '0':
-            # Enviar a lista de streams disponíveis
-            response = ",".join(videos.keys())
-            conn.send(response.encode('utf-8'))
-            logging.info(f"Sent available streams to {addr}: {response}")
-            print(f"Sent available streams to {addr}")  # Print importante para o terminal
-        else:
-            conn.send(b"Invalid Request")
-            logging.warning(f"Invalid request received from {addr}")
-    except Exception as e:
-        logging.error(f"Error handling client {addr}: {e}")
-        print(f"Error handling client {addr}")  # Print importante para o terminal
-    finally:
-        conn.close()
+    # Enviar a lista de streams disponíveis
+    response = ",".join(videos.keys())
+    conn.send(response.encode('utf-8'))
+    logging.info(f"Sent available streams to {addr}: {response}")
+    print(f"Sent available streams to {addr}")  # Print importante para o terminal
+    
 
 def start_server(ip, port):
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as server_socket:
