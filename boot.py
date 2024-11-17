@@ -46,7 +46,7 @@ def find_ip(addr):
     for node, interfaces in nodes.items():
         for ip, _ in interfaces:
             if ip == addr:
-                return node
+                return node                                     
     return None
 
 def handle_node_connection(conn, addr):
