@@ -1,10 +1,10 @@
-# pylint: disable=broad-exception-caught
-import socket
+import socket 
 import sys
 import json
 import threading
 from threading import Thread
 import time
+
 
 global_lock = threading.Lock()
 condition = threading.Condition(global_lock)
@@ -35,6 +35,14 @@ nodes = {
     "PC1": [("10.0.25.20", 0)],
     "PC4": [("10.0.26.21", 0)],
     "S": [("10.0.1.10", 5000), ("10.0.0.10", 0)]
+}
+
+control = {
+    "O7": (0,[]),
+    "O6": (0,[]),
+    "O5": (0,[]),
+    "O4": (0,[]),
+    "O3": (0,[])
 }
 
 streams = []
@@ -141,11 +149,10 @@ def update_port(node_name):
     return None
 
 def add_node_to_connected(node):
-    with global_lock:
-        with path_check_lock:
-            if node not in nodes_connected:
-                nodes_connected.append(node)
-                path_check_condition.notify()  
+    with path_check_lock:
+        if node not in nodes_connected:
+            nodes_connected.append(node)
+        path_check_condition.notifyAll()
 
 def handle_node_connection(conn, addr):
     print(f"Conexão recebida de {addr}")
@@ -154,7 +161,7 @@ def handle_node_connection(conn, addr):
     print(f"Nó identificado: {node}")
     try:
         if node.startswith("O"):
-            if node not in nodes_connected:
+            if node not in nodes_connected or (node in nodes_connected and control[node][0]==1) :
                 add_node_to_connected(node)
                 port = update_port(node)  # Atualiza a porta baseada no nome do nó
 
@@ -166,7 +173,7 @@ def handle_node_connection(conn, addr):
                 selected_interfaces = []
                 count = 0
                 pc = 0
-
+                
                 for neighbor in neighbors:
                     if neighbor in nodes_connected:
                         if neighbor.startswith("PC"):
@@ -175,13 +182,13 @@ def handle_node_connection(conn, addr):
                             count += 1
                             # Especial tratamento para O2 como um boot node
                             # Selecionar uma interface não usada e não hardcoded para O2
-                            interfaces = [iface for iface in nodes.get("O2", []) if iface[1] == 0 and iface != ("10.0.11.1", 5001)]
+                            """ interfaces = [iface for iface in nodes.get("O2", []) if iface[1] == 0 and iface != ("10.0.11.1", 5001)]
                             if interfaces:
                                 new_port = update_port("O2") + 1
                                 selected_interface = min(interfaces, key=lambda x: x[1])  # escolher a interface com menor valor de porta
                                 selected_interfaces.append((selected_interface[0], new_port))
                                 # Criar uma thread para ouvir conexões nessa nova porta
-                                threading.Thread(target=neighbours_connections, args=(selected_interface[0], new_port)).start()
+                                threading.Thread(target=neighbours_connections, args=(selected_interface[0], new_port)).start() """
                         else:
                             count += 1
                             interfaces = nodes.get(neighbor, [])
@@ -192,50 +199,81 @@ def handle_node_connection(conn, addr):
                                 else:
                                     min_interface = min(interfaces, key=lambda x: x[1])
                                 selected_interfaces.append(min_interface)
+
                 if len(selected_interfaces) == 0:
                     data_to_send = [addr[0], port]
                     message_code = 0
-                elif count == len(neighbors) - 1:  # Descontar o "O2" da contagem
+                elif count == len(neighbors):  # Descontar o "O2" da contagem
                     data_to_send = selected_interfaces
                     message_code = 1
                 else:
                     data_to_send = [selected_interfaces, [addr[0], port]]
                     message_code = 2
 
+                control[node]=(message_code,selected_interfaces)
                 complete_message = json.dumps({"code": message_code, "node": node ,"data": data_to_send, "pc": pc})
                 conn.send(complete_message.encode('utf-8'))
 
-               
-                try:
-                    while True:
-                        # Espera por uma mensagem de heartbeat
-                        heartbeat = conn.recv(1024)
-                        if heartbeat:
-                            conn.settimeout(3)
-                        else:
-                            print("Cliente desconectado.")
-                            break
-                except (ConnectionResetError, socket.timeout, OSError) as e:
-                    print(f"Erro ou desconexão detectada: {e}")
-            
             else:
-                with global_lock:
-                    condition.notify_all()
-                    message_code = 3 
-                    complete_message = json.dumps({"code": message_code})
-                    conn.send(complete_message.encode('utf-8'))
-                try:
-                    while True:
-                        # Espera por uma mensagem de heartbeat
-                        heartbeat = conn.recv(1024)
-                        if heartbeat:
-                            conn.settimeout(3)
-                        else:
-                            print("Cliente desconectado.")
-                            break
-                except (ConnectionResetError, socket.timeout, OSError) as e:
-                    print(f"Erro ou desconexão detectada: {e}")
+                pc=0
+                add_node_to_connected(node)
+                port = update_port(node)  # Atualiza a porta baseada no nome do nó
+                if control[node][0]==0:
+                    data_to_send = [addr[0], port]
+                    message_code = 0
+                
+                else:
+                                
+                    # Atualizar as interfaces do próprio nó com a nova porta
+                    current_interfaces = nodes.get(node, [])
+                    nodes[node] = [(ip, port if ip == addr[0] else old_port) for ip, old_port in current_interfaces]
 
+                    neighbors = nodes_neighbors.get(node, [])
+                    selected_interfaces = []
+                    count = 0
+                    pc = 0
+                    
+                    for neighbor in neighbors:
+                        if neighbor in nodes_connected:
+                            if neighbor.startswith("PC"):
+                                pc = 1
+                            elif neighbor == "O2":
+                                count += 1
+                                # Especial tratamento para O2 como um boot node
+                                # Selecionar uma interface não usada e não hardcoded para O2
+                                """ interfaces = [iface for iface in nodes.get("O2", []) if iface[1] == 0 and iface != ("10.0.11.1", 5001)]
+                                if interfaces:
+                                    new_port = update_port("O2") + 1
+                                    selected_interface = min(interfaces, key=lambda x: x[1])  # escolher a interface com menor valor de porta
+                                    selected_interfaces.append((selected_interface[0], new_port))
+                                    # Criar uma thread para ouvir conexões nessa nova porta
+                                    threading.Thread(target=neighbours_connections, args=(selected_interface[0], new_port)).start() """
+                            else:
+                                count += 1
+                                interfaces = nodes.get(neighbor, [])
+                                if interfaces:
+                                    valid_interfaces = [iface for iface in interfaces if iface[1] != 0]
+                                    if valid_interfaces:
+                                        min_interface = min(valid_interfaces, key=lambda x: x[1])
+                                    else:
+                                        min_interface = min(interfaces, key=lambda x: x[1])
+                                    selected_interfaces.append(min_interface)
+
+                    if len(selected_interfaces) == 0:
+                        data_to_send = [addr[0], port]
+                        message_code = 0
+                    elif count == len(neighbors):  # Descontar o "O2" da contagem
+                        data_to_send = selected_interfaces
+                        message_code = 1
+                    else:
+                        data_to_send = [selected_interfaces, [addr[0], port]]
+                        message_code = 2
+
+                    control[node]=(message_code,selected_interfaces)
+
+                complete_message = json.dumps({"code": message_code, "node": node ,"data": data_to_send, "pc": pc})
+                conn.send(complete_message.encode('utf-8'))
+                
         elif node.startswith("PC"):
             add_node_to_connected(node)
             neighbors = nodes_neighbors.get(node, [])
@@ -282,33 +320,14 @@ def handle_node_connection(conn, addr):
                     # Envia mensagem do tipo 2 se há vizinhos conectados, mas sem interfaces válidas
                     conn.send(json.dumps({"code": 2}).encode('utf-8'))
                     print(f"Mensagem do tipo 2 enviada para {node}, vizinhos conectados sem interfaces válidas")
-            try:
-                while True:
-                    data = conn.recv(1024).decode('utf-8')
-                    if data:
-                        print(f"Mensagem recebida de {node}: {data}")
-                        # Processa mensagens específicas do PC aqui
-                        message = json.loads(data)
-                        if message.get("request") == "streams":
-                            streams_response = json.dumps({"streams": streams})
-                            conn.send(streams_response.encode('utf-8'))
-                    else:
-                        print(f"Cliente {node} desconectado.")
-                        break
-            except Exception as e:
-                print(f"Erro ao processar mensagens de {node}: {e}")
-            finally:
-                print(f"Conexão com {node} encerrada.")
     finally:
         conn.close()
         print(f"Conexão com {addr} encerrada.")
-        result = wait_for_reactivation(node)
-        if result: print("Cliente Morto")
-        else: print("Cliente Reativado")
         
 
 def start_bootstrapper(host='0.0.0.0', port=5001):
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+        s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)  # Permite reutilizar o endereço
         s.bind((host, port))
         s.listen()
         print(f"Bootstrapper started at {host}:{port}, waiting for node connections...")
@@ -318,18 +337,6 @@ def start_bootstrapper(host='0.0.0.0', port=5001):
             conn, addr = s.accept()
             threading.Thread(target=handle_node_connection, args=(conn, addr)).start()
 
-
-
-def wait_for_reactivation(node):
-    with condition:
-        reactivated = condition.wait(timeout=3)
-        if reactivated:
-            print("Nó foi reativado.")
-            return 0
-        else:
-            print("Timeout esperando reativação.")
-            nodes_connected.remove(node)
-            return 1
 
 # Logic for requesting available streams from the server
 def server_con(server_host, server_port):

@@ -4,6 +4,7 @@ import subprocess
 import threading
 import sys
 
+
 # Lista de vídeos e portas onde cada um será transmitido
 videos = {
     "video1.mp4": 8080,
