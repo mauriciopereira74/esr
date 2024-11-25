@@ -47,52 +47,78 @@ control = {
 
 streams = []
 nodes_connected = []
+rtt_weights = {}
 
-def bfs_path_exists(start_node, end_node, graph):
-    visited = set()
-    queue = [start_node]
-    print(f"Iniciando BFS de {start_node} para {end_node}")
+def dijkstra_path_exists(start_node, end_node, graph):
+    """
+    Verifica se há um caminho de menor custo entre start_node e end_node usando o algoritmo de Dijkstra.
+    Retorna True se o caminho existir, False caso contrário.
+    """
+    import heapq
 
-    while queue:
-        node = queue.pop(0)
-        if node == end_node:
-            print("Caminho encontrado!")
+    # Verifica se os nós estão no grafo
+    if start_node not in graph or end_node not in graph:
+        print(f"Nós {start_node} ou {end_node} não estão no grafo. Caminho não encontrado.")
+        return False
+
+    distances = {node: float('inf') for node in graph}
+    distances[start_node] = 0
+    priority_queue = [(0, start_node)]  # (custo acumulado, nó atual)
+
+    while priority_queue:
+        current_distance, current_node = heapq.heappop(priority_queue)
+
+        # Se chegamos ao nó final, o caminho existe
+        if current_node == end_node:
             return True
-        
-        visited.add(node)
-        # Extend the queue only with connected neighbors
-        queue.extend([n for n in graph.get(node, []) if n not in visited and n in nodes_connected])
 
+        # Se o nó já foi visitado com menor custo, ignore
+        if current_distance > distances[current_node]:
+            continue
+
+        # Explora os vizinhos
+        for neighbor, weight in graph[current_node].items():
+            distance = current_distance + weight
+            if distance < distances[neighbor]:
+                distances[neighbor] = distance
+                heapq.heappush(priority_queue, (distance, neighbor))
+
+    # Se o loop terminar sem alcançar o end_node, o caminho não existe
     return False
 
 
+
 def check_stream_path():
+    """
+    Verifica continuamente se todos os PCs têm caminhos válidos para o servidor 'S'
+    usando os pesos de RTT.
+    """
     pcs = [node for node in nodes if node.startswith("PC")]  # Identifica todos os PCs
-    paths_available = {pc: False for pc in pcs}  # Inicia um dicionário para controlar os caminhos disponíveis
+    paths_available = {pc: False for pc in pcs}  # Dicionário para monitorar caminhos encontrados
 
     while True:
         with path_check_condition:
-            path_check_condition.wait()  # Espera notificação de nova conexão
+            path_check_condition.wait()  # Espera até que novos nós ou latências sejam adicionados
 
-        paths_found_this_round = []
-        # Verifica se existe caminho para o servidor "S" de cada PC
+        # Verifica se os nós principais estão no rtt_weights
+        if "S" not in rtt_weights or any(pc not in rtt_weights for pc in pcs):
+            print("Nodos principais ainda não registrados no RTT weights.")
+            continue
+
+        # Verifica caminhos para todos os PCs
         for pc in pcs:
-            if not paths_available[pc] and bfs_path_exists(pc, 'S', nodes_neighbors):
-                paths_available[pc] = True  # Marca o PC como tendo um caminho disponível
-                paths_found_this_round.append(pc)
+            if not paths_available[pc]:  # Apenas verifica os PCs que ainda não têm caminhos
+                if dijkstra_path_exists(pc, "S", rtt_weights):
+                    paths_available[pc] = True
+                    print(f"Caminho disponível para o stream do {pc} ao servidor S.")
 
-        # Verifica se todos os PCs têm caminhos disponíveis
+        # Verifica se todos os PCs têm caminhos
         if all(paths_available.values()):
             print("Caminhos disponíveis para stream de todos os PCs para o servidor S.")
             with tree_lock:
-                tree_condition.notify_all()
-            break  # Ou continue, dependendo se você quer parar após a primeira verificação bem-sucedida ou não
-        elif paths_found_this_round:
-            # Mostra quais PCs tiveram caminhos encontrados nesta verificação
-            available_paths = ', '.join(paths_found_this_round)
-            print(f"Caminhos disponíveis para stream dos seguintes PCs para o servidor S: {available_paths}")
-        else:
-            print(f"Não foram encontrados caminhos")
+                tree_condition.notify_all()  # Notifica que todos os caminhos foram encontrados
+            break
+
 
 
 def neighbours_connections(host, port):
@@ -273,6 +299,50 @@ def handle_node_connection(conn, addr):
 
                 complete_message = json.dumps({"code": message_code, "node": node ,"data": data_to_send, "pc": pc})
                 conn.send(complete_message.encode('utf-8'))
+
+            data = conn.recv(1024)
+
+            try:
+                message = json.loads(data.decode('utf-8'))
+
+                # Processar mensagem de RTT
+                if message.get("type") == "rtt_update":
+                    latencies = message.get("latencies", {})
+                    for neighbor, rtt in latencies.items():
+                        # Separar o endereço IP da porta
+                        neighbor_ip = neighbor.split(':')[0]  # Extrai o IP antes do ';'
+                        one_way_delay = rtt / 2  # Dividindo o RTT por 2
+                        print(f"Tempo de ida (one-way delay) entre {node} e {neighbor_ip}: {one_way_delay:.2f} ms")
+
+                        # Resolver o nome do nó a partir do IP
+                        node_name = None
+                        for n, interfaces in nodes.items():
+                            for interface_ip, _ in interfaces:
+                                if neighbor_ip == interface_ip:
+                                    node_name = n
+                                    break
+                            if node_name:
+                                break
+
+                        # Ignorar se o IP não for encontrado
+                        if not node_name:
+                            print(f"IP {neighbor_ip} não encontrado no dicionário nodes.")
+                            continue
+
+                        # Atualizar o peso no dicionário de RTTs
+                        with global_lock:
+                            if node not in rtt_weights:
+                                rtt_weights[node] = {}
+                            if node_name not in rtt_weights:
+                                rtt_weights[node_name] = {}
+                            rtt_weights[node][node_name] = one_way_delay
+                            rtt_weights[node_name][node] = one_way_delay  # Direção oposta
+
+                    print("Dicionário de RTTs atualizado:")
+                    print(rtt_weights)
+
+            except json.JSONDecodeError:
+                print(f"Mensagem inválida recebida de {node}: {data.decode('utf-8')}")
                 
         elif node.startswith("PC"):
             add_node_to_connected(node)
@@ -323,6 +393,32 @@ def handle_node_connection(conn, addr):
     finally:
         conn.close()
         print(f"Conexão com {addr} encerrada.")
+
+def initialize_rtt_weights():
+    """
+    Inicializa o dicionário rtt_weights com pesos infinitos entre todos os nós.
+    Isso garante que todos os nós estejam no grafo antes de qualquer cálculo.
+    """
+    global rtt_weights
+
+    # Inicializa todos os nós no rtt_weights
+    for node in nodes_neighbors:
+        if node not in rtt_weights:
+            rtt_weights[node] = {}
+        for neighbor in nodes_neighbors[node]:
+            # Garante que o vizinho também esteja no dicionário
+            if neighbor not in rtt_weights:
+                rtt_weights[neighbor] = {}
+
+            # Define pesos infinitos bidirecionais
+            if neighbor not in rtt_weights[node]:
+                rtt_weights[node][neighbor] = float('inf')
+            if node not in rtt_weights[neighbor]:
+                rtt_weights[neighbor][node] = float('inf')
+
+    print("RTT weights inicializado:")
+    print(rtt_weights)
+
         
 
 def start_bootstrapper(host='0.0.0.0', port=5001):
@@ -333,6 +429,7 @@ def start_bootstrapper(host='0.0.0.0', port=5001):
         print(f"Bootstrapper started at {host}:{port}, waiting for node connections...")
         nodes_connected.append("S")
         nodes_connected.append("O2")
+        initialize_rtt_weights()
         while True:
             conn, addr = s.accept()
             threading.Thread(target=handle_node_connection, args=(conn, addr)).start()

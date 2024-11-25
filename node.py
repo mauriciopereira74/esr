@@ -36,9 +36,7 @@ def listen_for_connections(host, port):
 
 
 def handle_connection(client_socket, host, port, addr):
-    """
-    Trata mensagens recebidas de uma conexão específica e estabelece uma nova conexão para heartbeats.
-    """
+
     try:
 
         with lock_host:
@@ -53,12 +51,25 @@ def handle_connection(client_socket, host, port, addr):
             data = client_socket.recv(1024)
             if not data:
                 break
-            try:
-                message = json.loads(data.decode('utf-8'))
-                print(f"Message received from {host}: {message}")
 
-            except json.JSONDecodeError:
-                print(f"Invalid message from {host}: {data.decode('utf-8')}")
+            try:
+                message = data.decode('utf-8')
+
+                # Verifica se a mensagem é um ping
+                if message == "ping":
+                    # Envia a resposta "ping_ack" para o remetente
+                    client_socket.send(b"ping_ack")
+                    print(f"Ping received from {addr}, sent ping_ack")
+                else:
+                    # Trate outras mensagens (exemplo: JSON)
+                    try:
+                        json_message = json.loads(message)
+                        print(f"Message received from {addr}: {json_message}")
+                    except json.JSONDecodeError:
+                        print(f"Invalid message from {addr}: {message}")
+
+            except Exception as e:
+                print(f"Error processing message from {addr}: {e}")
 
     except Exception as e:
         print(f"Connection error with {host}: {e}")
@@ -100,7 +111,7 @@ def send_heartbeats(socket, host):
     try:
         while True:
             socket.send(b"heartbeat")
-            print(f"Heartbeat sent from {host}")
+            #print(f"Heartbeat sent from {host}")
             time.sleep(2)
     except Exception as e:
         pass
@@ -117,7 +128,8 @@ def receive_heartbeats(socket, host):
             try:
                 data = socket.recv(1024)
                 if data:
-                    print(f"Heartbeat received in {host}")
+                    pass
+                    #print(f"Heartbeat received in {host}")
                 else:
                     # Quando data é vazio, significa que a conexão foi fechada pelo outro lado
                     print(f"Heartbeat connection lost in {host}")
@@ -138,7 +150,7 @@ def send_heartbeats_connected(socket, neighbour):
     try:
         while True:
             socket.send(b"heartbeat")
-            print(f"Heartbeat sent to {neighbour}")
+            #print(f"Heartbeat sent to {neighbour}")
             time.sleep(2)
     except Exception as e:
         pass
@@ -155,7 +167,8 @@ def receive_heartbeats_connected(socket, neighbour):
             try:
                 data = socket.recv(1024)
                 if data:
-                    print(f"Heartbeat received from {neighbour}")
+                    pass
+                    #print(f"Heartbeat received from {neighbour}")
                 else:
                     print(f"Heartbeat connection lost from {neighbour}")
                     break
@@ -169,12 +182,26 @@ def receive_heartbeats_connected(socket, neighbour):
         print("Closing connection to", neighbour)
         socket.close()
 
-def connect_to_neighbors(neighbors):
+def connect_to_neighbors(neighbors, condition, lock, latencies):
     """
-    Conecta a cada vizinho da lista e inicia threads para gerenciar a comunicação.
+    Conecta a cada vizinho da lista e mede RTTs.
+    Atualiza a lista de RTTs em `latencies` e utiliza threading para conexões.
     """
+    completed_neighbors = 0
+
+    def measure_rtt_for_neighbor(sock, neighbor_ip, neighbor_port):
+        """
+        Mede o RTT de um vizinho específico e atualiza a lista de latências.
+        """
+        nonlocal completed_neighbors
+        rtt = measure_rtt_with_socket(sock)
+        with lock:
+            latencies[f"{neighbor_ip}:{neighbor_port}"] = rtt
+            completed_neighbors += 1
+            if completed_neighbors == len(neighbors):
+                condition.notify_all()
+
     try:
-        # Tenta se conectar a cada vizinho
         for neighbor_ip, neighbor_port in neighbors:
             try:
                 print(f"Attempting to connect to neighbor {neighbor_ip}:{neighbor_port}")
@@ -183,10 +210,23 @@ def connect_to_neighbors(neighbors):
                 print(f"Connected to neighbor {neighbor_ip}:{neighbor_port}")
                 connections.append(sock)
 
-                # Iniciar uma thread para gerenciar a comunicação após a conexão ser estabelecida
-                threading.Thread(target=manage_connection, args=(sock,neighbor_ip,neighbor_port), daemon=True).start()
+                # Medir RTT em uma thread
+                threading.Thread(
+                    target=measure_rtt_for_neighbor,
+                    args=(sock, neighbor_ip, neighbor_port),
+                    daemon=True
+                ).start()
+
+                # Gerenciar comunicação com o vizinho
+                threading.Thread(
+                    target=manage_connection,
+                    args=(sock, neighbor_ip, neighbor_port),
+                    daemon=True
+                ).start()
+
             except Exception as e:
                 print(f"Failed to connect to neighbor {neighbor_ip}:{neighbor_port}: {e}")
+
     except Exception as e:
         print(f"Error connecting to neighbors: {e}")
 
@@ -294,6 +334,27 @@ def connect_to_pc(pc_address, pc_port):
     except Exception as e:
         print(f"Failed to open UDP socket to PC at {pc_address}:{pc_port}: {e}")
 
+def measure_rtt_with_socket(sock):
+    """
+    Mede o RTT usando um socket já aberto.
+    Envia um 'ping' e espera a resposta 'ping_ack'.
+    """
+    try:
+        start_time = time.time()
+        sock.send(b"ping")  # Envia o ping
+        response = sock.recv(1024)  # Aguarda a resposta
+        end_time = time.time()
+
+        if response == b"ping_ack":
+            rtt = (end_time - start_time) * 1000  # RTT em milissegundos
+            return rtt
+        else:
+            print(f"Unexpected response: {response}")
+            return float('inf')
+    except Exception as e:
+        print(f"Failed to measure RTT: {e}")
+        return float('inf')
+
 
 def connect_to_bootstrapper(host, port):
     """
@@ -303,6 +364,12 @@ def connect_to_bootstrapper(host, port):
     my_tcp = None
     my_port = None
     global node
+
+    # Variáveis para medir RTT
+    latencies = {}
+    lock = threading.Lock()
+    condition = threading.Condition(lock)
+
 
     try:
         client_socket.connect((host, port))
@@ -314,7 +381,7 @@ def connect_to_bootstrapper(host, port):
             print(f"Received data: {data_json}")
 
             message_code = data_json['code']
-            node=data_json['node']
+            node = data_json['node']
 
             if message_code == 0:
                 data = data_json['data']
@@ -322,9 +389,6 @@ def connect_to_bootstrapper(host, port):
 
                 my_tcp = address
                 my_port = port_received
-
-                print(f"Address received and stored: {my_tcp}")
-                print(f"Port received and stored: {my_port}")
 
                 threading.Thread(target=listen_for_connections, args=(my_tcp, my_port), daemon=True).start()
 
@@ -338,8 +402,24 @@ def connect_to_bootstrapper(host, port):
                 data = data_json['data']
                 neighbors_list = data
 
-                print(f"Neighbor interfaces received: {neighbors_list}")
-                threading.Thread(target=connect_to_neighbors, args=(neighbors_list,), daemon=True).start()
+                # Chama connect_to_neighbors em uma thread
+                threading.Thread(
+                    target=connect_to_neighbors,
+                    args=(neighbors_list, condition, lock, latencies),
+                    daemon=True
+                ).start()
+
+                with lock:
+                    condition.wait()
+
+                # Enviar RTTs ao bootstrapper
+                data_to_send = {
+                    "type": "rtt_update",
+                    "node": node,
+                    "latencies": latencies
+                }
+                client_socket.send(json.dumps(data_to_send).encode('utf-8'))
+                #print(f"RTTs sent to bootstrapper: {latencies}")
 
             elif message_code == 2:
                 data = data_json['data']
@@ -349,11 +429,29 @@ def connect_to_bootstrapper(host, port):
                 my_tcp = address
                 my_port = port_received
 
-                print(f"Address and port received: {my_tcp}, {my_port}")
-                print(f"Neighbor interfaces received and stored: {neighbors_list}")
-
                 threading.Thread(target=listen_for_connections, args=(my_tcp, my_port), daemon=True).start()
-                threading.Thread(target=connect_to_neighbors, args=(neighbors_list,), daemon=True).start()
+
+                # Chama connect_to_neighbors em uma thread
+                threading.Thread(
+                    target=connect_to_neighbors,
+                    args=(neighbors_list, condition, lock, latencies),
+                    daemon=True
+                ).start()
+
+                # Espera até que todos os RTTs sejam medidos
+                with condition:
+                    condition.wait()  # Espera o notify_all()
+
+                print(f"All RTTs measured: {latencies}")
+
+                # Enviar RTTs ao bootstrapper
+                data_to_send = {
+                    "type": "rtt_update",
+                    "node": node,
+                    "latencies": latencies
+                }
+                client_socket.send(json.dumps(data_to_send).encode('utf-8'))
+                print(f"RTTs sent to bootstrapper: {latencies}")
 
                 pc = data_json['pc']
                 if pc:
@@ -371,6 +469,7 @@ def connect_to_bootstrapper(host, port):
         print(f"An error occurred: {e}")
     finally:
         client_socket.close()
+
 
 
 if __name__ == "__main__":
