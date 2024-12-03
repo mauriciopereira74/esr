@@ -37,55 +37,37 @@ def handle_client_connection(conn, addr):
     Manipula a conexão TCP inicial com o cliente para enviar streams disponíveis.
     """
     try:
-        # Enviar a lista de streams disponíveis
+        # Enviar a lista inicial de streams disponíveis
         response = ",".join(videos.keys())
         conn.send(response.encode('utf-8'))
         print(f"Sent available streams to {addr}: {response}")
 
-        try:
-            while True:
-                # Aguarda uma mensagem do cliente
-                data = conn.recv(1024)
-                if not data:
-                    print(f"Conexão encerrada pelo cliente {addr}")
-                    break
+        while True:
+            # Aguarda uma mensagem do cliente
+            data = conn.recv(1024)
+            if not data:
+                print(f"Conexão encerrada pelo cliente {addr}")
+                break
 
-                try:
-                    # Decodifica a mensagem como JSON
-                    message = json.loads(data.decode('utf-8'))
-                    code = message.get("code")
+            try:
+                # Decodifica a mensagem como JSON
+                message = json.loads(data.decode('utf-8'))
+                code = message.get("type")
 
-                    if code == 1:
-                        print(f"Mensagem recebida de {addr}: {message}")
+                if code == 1:
+                    print(f"Mensagem recebida de {addr}: {message}")
 
-                        # Envia um ACK "0" de confirmação
-                        ack = "0"
-                        conn.send(ack.encode('utf-8'))
-                        print(f"ACK '0' enviado para {addr}")
+                    # Envia a lista de streams disponíveis
+                    response = {
+                        "streams": list(videos.keys())
+                    }
+                    conn.send(json.dumps(response).encode('utf-8'))
+                    print(f"Streams enviados para {addr}: {response['streams']}")
 
-                        # Envia a lista de streams disponíveis
-                        response = {
-                            "streams": list(videos.keys())
-                        }
-                        conn.send(json.dumps(response).encode('utf-8'))
-                        print(f"Streams enviados para {addr}: {response['streams']}")
-
-                        # Aguarda confirmação de recebimento do cliente
-                        confirmation = conn.recv(1024)
-                        if confirmation:
-                            confirmation_message = confirmation.decode('utf-8')
-                            if confirmation_message == "0":
-                                print(f"Confirmação de recebimento dos streams recebida de {addr}")
-                            else:
-                                print(f"Confirmação inválida recebida de {addr}: {confirmation_message}")
-
-                    else:
-                        print(f"Mensagem com código desconhecido recebida de {addr}: {message}")
-
-                except json.JSONDecodeError:
-                    print(f"Erro ao decodificar mensagem JSON de {addr}: {data.decode('utf-8')}")
-        except Exception as e:
-            print(f"Erro ao processar a mensagem de {addr}: {e}")
+            except json.JSONDecodeError:
+                print(f"Erro ao decodificar mensagem JSON de {addr}: {data.decode('utf-8')}")
+            except Exception as e:
+                print(f"Erro ao processar a mensagem de {addr}: {e}")
 
     except Exception as e:
         print(f"Erro ao manipular conexão com o cliente {addr}: {e}")
