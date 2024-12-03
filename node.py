@@ -7,13 +7,61 @@ import time
 
 global connections
 global node
+global pedido
 lock_host = threading.Lock()
 condition_lock_host = threading.Condition(lock_host)
 lock_neighbor = threading.Lock()
 condition_lock_neighbor = threading.Condition(lock_neighbor)
+lock_6 = threading.Lock()
+condition_6 = threading.Condition(lock_6)
 connections = []
 connection_active_host = []
 connection_neighbor=[]
+next_hops={}
+
+def server_con(server_host, server_port):
+    """
+    Conecta ao servidor via TCP para obter streams disponíveis,
+    encerra a conexão e calcula o RTT via UDP.
+    """
+    try:
+        # Criar uma conexão TCP inicial para obter informações
+        tcp_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        tcp_socket.connect((server_host, server_port))
+        print(f"Connected to server at {server_host}:{server_port} via TCP")
+
+        response = tcp_socket.recv(1024).decode()
+
+        # Encerra a conexão TCP
+        tcp_socket.close()
+        
+
+        # Inicia a conexão UDP para calcular RTT
+        udp_socket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        udp_socket.connect((server_host, server_port))
+
+        # Calcular RTT enviando um "ping"
+        start_time = time.time()
+        udp_socket.send(b"ping")  # Enviar mensagem "ping"
+        data, addr = udp_socket.recvfrom(1024)  # Aguarda resposta "pong"
+        end_time = time.time()
+
+        if data and data.decode() == "pong":
+            rtt = (end_time - start_time) * 1000  # RTT em milissegundos
+            return rtt
+
+        else:
+            print("No valid response received for RTT calculation.")
+
+        # Fechar a conexão UDP
+        udp_socket.close()
+        print("UDP connection closed.")
+
+        return None
+
+    except Exception as e:
+        print(f"Error in server_con: {e}")
+
 
 
 def listen_for_connections(host, port):
@@ -38,12 +86,9 @@ def listen_for_connections(host, port):
 def handle_connection(client_socket, host, port, addr):
 
     try:
-
         with lock_host:
             connection_active_host.append(addr)
             condition_lock_host.notify_all()
-
-
         new_port = port + 1
         threading.Thread(target=setup_heartbeat_connection, args=(host, new_port), daemon=True).start()
 
@@ -204,7 +249,6 @@ def connect_to_neighbors(neighbors, condition, lock, latencies):
     try:
         for neighbor_ip, neighbor_port in neighbors:
             try:
-                print(f"Attempting to connect to neighbor {neighbor_ip}:{neighbor_port}")
                 sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
                 sock.connect((neighbor_ip, int(neighbor_port)))
                 print(f"Connected to neighbor {neighbor_ip}:{neighbor_port}")
@@ -321,18 +365,59 @@ def manage_heartbeats(neighbor_ip, neighbor_port):
         heartbeat_socket.close()
 
 
-
-def connect_to_pc(pc_address, pc_port):
+def connect_to_pc_bind(pc_address, pc_port):
     """
-    Cria uma conexão UDP para o PC.
+    Cria uma conexão UDP para o PC, escuta mensagens e responde com "pong" ao receber "ping".
+    A primeira mensagem é esperada sem timeout, após isso é ativado um timeout de 1 segundo.
     """
     try:
         udp_socket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         udp_socket.bind((pc_address, pc_port))  # Vincula ao endereço com uma porta específica
         print(f"UDP socket bound to {pc_address}:{pc_port}")
-        # Aqui você pode implementar lógica para enviar dados ou manter o socket ouvindo
+
+        first_message = True  # Indica se é a primeira mensagem
+        global pedido
+        while True:
+            try:
+                # Aguarda a mensagem
+                if first_message:
+                    print("Aguardando primeira mensagem")
+                    data, addr = udp_socket.recvfrom(1024)
+                    data_json = json.loads(data.decode())
+                    message = data_json["code"]
+                    first_message = False  # Após a primeira mensagem, ativa o timeout
+                    udp_socket.settimeout(1.0)  # Configura timeout de 1 segundo~
+                else:
+                    data, addr = udp_socket.recvfrom(1024)  # Com timeout de 1 segundo
+
+                if data:
+                    print(f"Mensagem recebida do cliente {addr}: {message}")
+
+                    # Verifica se a mensagem é "ping" e responde com "pong"
+                    if message == 0:
+                        udp_socket.sendto(b"pong", addr)
+                        print(f"Resposta 'pong' enviada para {addr}")
+                        first_message = True 
+                        udp_socket.settimeout(None) 
+                    elif message == 1:
+                        udp_socket.sendto(b"0", addr)
+                        sender = data_json["sender"]
+                        destination = data_json["destination"]
+                        udp_ip, port_ip = next_hops[destination]
+                        threading.Thread(target=handle_socket_connect, args = (udp_ip,port_ip,sender,destination,1),  daemon=True).start()
+                        print(f"Resposta '0' enviada para {addr}")
+                        first_message = True 
+                        udp_socket.settimeout(None) 
+                    
+
+            except socket.timeout:
+                pass
+
     except Exception as e:
-        print(f"Failed to open UDP socket to PC at {pc_address}:{pc_port}: {e}")
+        print(f"Falha ao criar socket UDP para o PC no endereço {pc_address}:{pc_port}: {e}")
+    finally:
+        udp_socket.close()
+        print("Socket UDP encerrado.")
 
 def measure_rtt_with_socket(sock):
     """
@@ -354,8 +439,133 @@ def measure_rtt_with_socket(sock):
     except Exception as e:
         print(f"Failed to measure RTT: {e}")
         return float('inf')
+    
+
+def handle_socket_listen(address, port):
+    """
+    Função para criar e gerenciar o socket UDP para escutar.
+    """
+    try:
+        udp_socket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        udp_socket.bind((address, port))  # Associa o socket ao endereço e porta
+        print(f"Socket UDP criado e escutando em {address}:{port}")
+
+        while True:
+            try:
+                data, addr = udp_socket.recvfrom(1024)  # Receber dados
+                if data:
+                    print(f"Mensagem recebida de {addr}: {data.decode('utf-8')}")
+
+                    # Tentar decodificar a mensagem como JSON
+                    try:
+                        data_json = json.loads(data.decode('utf-8'))
+                        code = data_json["code"]
+                        sender = data_json["sender"]
+                        destination = data_json["destination"]
+
+                        if code == 1:  # Mensagem para reencaminhamento básico
+                            udp_socket.sendto(b"0", addr)  # Envia ACK
+                            print(f"ACK '0' enviado para {addr}")
+
+                            # Reencaminhar mensagem para o próximo nó
+                            if destination in next_hops:
+                                udp_ip, port_ip = next_hops[destination]
+                                threading.Thread(
+                                    target=handle_socket_connect,
+                                    args=(udp_ip, port_ip, sender, destination, 1),
+                                    daemon=True
+                                ).start()
+                            else:
+                                print(f"Destino desconhecido: {destination}")
+
+                        elif code == 2:  # Mensagem de streams recebida
+                            streams = data_json.get("streams", [])
+                            udp_socket.sendto(b"0", addr)  # Envia ACK
+                            print(f"ACK '0' enviado para {addr}")
+                            print(f"Streams recebidas: {streams}")
+
+                            # Reencaminhar streams para o próximo nó
+                            if destination in next_hops:
+                                udp_ip, port_ip = next_hops[destination]
+                                threading.Thread(
+                                    target=handle_socket_connect,
+                                    args=(udp_ip, port_ip, sender, destination, 2, streams),
+                                    daemon=True
+                                ).start()
+                            else:
+                                print(f"Destino desconhecido: {destination}")
+                        else:
+                            print(f"Mensagem com código desconhecido recebida de {addr}: {data_json}")
+
+                    except json.JSONDecodeError:
+                        print(f"Erro ao decodificar mensagem JSON de {addr}: {data.decode('utf-8')}")
+
+            except Exception as e:
+                print(f"Erro ao receber dados no socket UDP: {e}")
+
+    except Exception as e:
+        print(f"Erro ao criar socket UDP para escuta: {e}")
+    finally:
+        udp_socket.close()
+        print(f"Socket UDP fechado em {address}:{port}")
 
 
+def handle_socket_connect(address, port, sender, destination, code, streams=None):
+    """
+    Função para criar e gerenciar o socket UDP para conexão.
+    Inclui lógica para enviar mensagens e, no caso de 'code == 2', as streams recebidas.
+    """
+    try:
+        udp_socket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        udp_socket.settimeout(1.0)  # Configura o timeout para 1 segundo
+        udp_socket.connect((address, port))
+        print(f"Conectado ao socket UDP no endereço {address}:{port}")
+
+        # Prepara a mensagem inicial para envio
+        message = {
+            "code": code,
+            "sender": sender,
+            "destination": destination
+        }
+        if streams:  # Adicionar streams se existirem
+            message["streams"] = streams
+
+        message_encoded = json.dumps(message).encode()
+
+        ack_received = False
+        max_retries = 5  # Define o número máximo de tentativas
+        retries = 0
+
+        while not ack_received and retries < max_retries:
+            # Envia a mensagem inicial
+            udp_socket.send(message_encoded)
+            print(f"Mensagem enviada para {address}:{port}: {message} (tentativa {retries + 1})")
+
+            try:
+                # Aguardar ACK
+                response = udp_socket.recv(1024).decode()
+                print(f"Resposta recebida: {response}")
+
+                if response == "0":
+                    print("ACK (0) recebido com sucesso!")
+                    ack_received = True
+                else:
+                    print(f"Resposta inesperada recebida: {response}")
+
+            except socket.timeout:
+                print(f"Timeout ao aguardar ACK. Reenviando a mensagem...")
+                retries += 1
+
+        if not ack_received:
+            print(f"Falha ao receber ACK após múltiplas tentativas.")
+
+    except Exception as e:
+        print(f"Erro ao conectar ao socket UDP: {e}")
+    finally:
+        udp_socket.close()
+        print("Socket fechado.")
+
+        
 def connect_to_bootstrapper(host, port):
     """
     Conecta ao bootstrapper para obter informações iniciais.
@@ -374,16 +584,32 @@ def connect_to_bootstrapper(host, port):
     try:
         client_socket.connect((host, port))
         print(f"Connected to bootstrapper at {host}:{port}")
-
+        
         data_encoded = client_socket.recv(1024).decode()
+
+       
         if data_encoded:
             data_json = json.loads(data_encoded)
             print(f"Received data: {data_json}")
-
             message_code = data_json['code']
             node = data_json['node']
+            my_udp_address, my_udp_port = data_json['my_udp']
+            
+            server_info=data_json['server']
+
+            if server_info:
+                server_ip,server_port=server_info
+                formatted = f"{server_info[0]}:{server_info[1]}"
+                rtt = server_con(server_ip,server_port)
+                latencies[formatted] = rtt
+    
+            threading.Thread(target=handle_socket_listen, args=(my_udp_address, my_udp_port)).start()
+            threading.Thread(target=handle_socket_listen, args=(my_udp_address, my_udp_port+1)).start()
 
             if message_code == 0:
+
+                bootneighbor = data_json['bootneighbor']
+                
                 data = data_json['data']
                 address, port_received = data
 
@@ -391,16 +617,48 @@ def connect_to_bootstrapper(host, port):
                 my_port = port_received
 
                 threading.Thread(target=listen_for_connections, args=(my_tcp, my_port), daemon=True).start()
-
+                
                 pc = data_json['pc']
-                if pc:
+                pc_interface = data_json['pc_interface']
+                if pc and not pc_interface:
                     pc_ip = my_tcp
                     pc_port = my_port + 1
-                    threading.Thread(target=connect_to_pc, args=(pc_ip, pc_port), daemon=True).start()
+                    threading.Thread(target=connect_to_pc_bind, args=(pc_ip, pc_port), daemon=True).start()
+                elif pc and pc_interface:
+                    for pc_i in pc_interface:
+                        pc_ip, pc_port = pc_i
+                        #threading.Thread(target=connect_to_pc, args=(pc_ip, pc_port+1), daemon=True).start()
 
+                if bootneighbor:
+                    # Enviar mensagem com código 0
+                    try:
+                        start_time = time.time()
+                        data_to_send = {
+                            "code": 0,
+                            "start_time": start_time,
+                            "node": node,
+                            "latencies": latencies
+                        }
+                        client_socket.sendall(json.dumps(data_to_send).encode('utf-8'))
+                        print(f"Message with code 0 sent: {data_to_send}")
+                    except Exception as e:
+                        print(f"Erro ao enviar mensagem de código 0: {e}")
+                else:
+                    # Enviar mensagem com código 10
+                    try:
+                        data_to_send = {
+                            "code": 10,
+                        }
+                        client_socket.sendall(json.dumps(data_to_send).encode('utf-8'))
+                        print(f"Message with code 10 sent: {data_to_send}")
+                    except Exception as e:
+                        print(f"Erro ao enviar mensagem de código 1: {e}")
+                        
             elif message_code == 1:
                 data = data_json['data']
                 neighbors_list = data
+
+                bootneighbor = data_json['bootneighbor']
 
                 # Chama connect_to_neighbors em uma thread
                 threading.Thread(
@@ -412,14 +670,40 @@ def connect_to_bootstrapper(host, port):
                 with lock:
                     condition.wait()
 
-                # Enviar RTTs ao bootstrapper
-                data_to_send = {
-                    "type": "rtt_update",
-                    "node": node,
-                    "latencies": latencies
-                }
-                client_socket.send(json.dumps(data_to_send).encode('utf-8'))
-                #print(f"RTTs sent to bootstrapper: {latencies}")
+                if bootneighbor:
+                    # Enviar mensagem com código 0
+                    try:
+                        start_time = time.time()
+                        data_to_send = {
+                            "code": 0,
+                            "start_time": start_time,
+                            "node": node,
+                            "latencies": latencies
+                        }
+                        client_socket.sendall(json.dumps(data_to_send).encode('utf-8'))
+                        print(f"Message with code 0 sent: {data_to_send}")
+                    except Exception as e:
+                        print(f"Erro ao enviar mensagem de código 0: {e}")
+                else:
+                    # Enviar mensagem com código 1
+                    try:
+                        data_to_send = {
+                            "code": 1,
+                            "node": node,
+                            "latencies": latencies
+                        }
+                        client_socket.sendall(json.dumps(data_to_send).encode('utf-8'))
+                        print(f"Message with code 1 sent: {data_to_send}")
+                    except Exception as e:
+                        print(f"Erro ao enviar mensagem de código 1: {e}")
+
+
+                pc = data_json['pc']
+                pc_interface = data_json['pc_interface']
+                if pc and not pc_interface:
+                    pc_ip = my_tcp
+                    pc_port = my_port + 1
+                    threading.Thread(target=connect_to_pc_bind, args=(pc_ip, pc_port), daemon=True).start()
 
             elif message_code == 2:
                 data = data_json['data']
@@ -438,38 +722,88 @@ def connect_to_bootstrapper(host, port):
                     daemon=True
                 ).start()
 
+                bootneighbor = data_json['bootneighbor']
+
                 # Espera até que todos os RTTs sejam medidos
                 with condition:
-                    condition.wait()  # Espera o notify_all()
-
-                print(f"All RTTs measured: {latencies}")
-
-                # Enviar RTTs ao bootstrapper
-                data_to_send = {
-                    "type": "rtt_update",
-                    "node": node,
-                    "latencies": latencies
-                }
-                client_socket.send(json.dumps(data_to_send).encode('utf-8'))
-                print(f"RTTs sent to bootstrapper: {latencies}")
+                    condition.wait()
+        
+                if bootneighbor:
+                    # Enviar mensagem com código 0
+                    try:
+                        start_time = time.time()
+                        data_to_send = {
+                            "code": 0,
+                            "start_time": start_time,
+                            "node": node,
+                            "latencies": latencies
+                        }
+                        client_socket.sendall(json.dumps(data_to_send).encode('utf-8'))
+                        print(f"Message with code 0 sent: {data_to_send}")
+                    except Exception as e:
+                        print(f"Erro ao enviar mensagem de código 0: {e}")
+                else:
+                    # Enviar mensagem com código 1
+                    try:
+                        data_to_send = {
+                            "code": 1,
+                            "node": node,
+                            "latencies": latencies
+                        }
+                        client_socket.sendall(json.dumps(data_to_send).encode('utf-8'))
+                        print(f"Message with code 1 sent: {data_to_send}")
+                    except Exception as e:
+                        print(f"Erro ao enviar mensagem de código 1: {e}")
 
                 pc = data_json['pc']
-                if pc:
+                pc_interface = data_json['pc_interface']
+                if pc and not pc_interface:
                     pc_ip = my_tcp
                     pc_port = my_port + 1
-                    threading.Thread(target=connect_to_pc, args=(pc_ip, pc_port), daemon=True).start()
-
+                    threading.Thread(target=connect_to_pc_bind, args=(pc_ip, pc_port), daemon=True).start()
+                    
             elif message_code == 3:
                 print("No neighbors to connect to.")
 
         else:
             print("No data received from the bootstrapper")
 
+        
+        while True:
+            try:
+                data_encoded = client_socket.recv(1024).decode()
+                if data_encoded:
+                    data_json = json.loads(data_encoded)
+                    print(f"Received data: {data_json}")
+
+                    # Identificar o tipo da mensagem
+                    message_code = data_json['type']  # Tipo da mensagem (0 ou 1)
+                    data = data_json['data']
+                    address = data['address']  # IP recebido
+                    port = data['port']   
+                    destinations = data['destinations']     # Porta recebida
+                    if message_code == 1:  # Mensagem do tipo 1
+                        for d in destinations:
+                            if d not in next_hops or next_hops[d] != address:
+                                next_hops[d] = (address,port)
+                                print(f"Destino {d} próximo passo {address} na porta {port}")
+                    elif message_code == 2:
+                        if destinations not in next_hops or next_hops[destinations] != address:
+                            next_hops[destinations] = (address,port)
+                            print(f"Destino {destinations} próximo passo {address} na porta {port}")
+                    else:
+                        print(f"Mensagem com tipo desconhecido recebida: {message_code}")
+
+            except json.JSONDecodeError:
+                print(f"Erro ao decodificar mensagem recebida: {data_encoded}")
+            except Exception as e:
+                print(f"Erro ao processar mensagem recebida: {e}")  
+
     except Exception as e:
         print(f"An error occurred: {e}")
     finally:
         client_socket.close()
-
+        pass
 
 
 if __name__ == "__main__":
