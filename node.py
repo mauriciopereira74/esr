@@ -8,6 +8,7 @@ import time
 global connections
 global node
 global pedido
+
 lock_host = threading.Lock()
 condition_lock_host = threading.Condition(lock_host)
 lock_neighbor = threading.Lock()
@@ -18,50 +19,226 @@ connections = []
 connection_active_host = []
 connection_neighbor=[]
 next_hops={}
+control=[]
 
-def server_con(server_host, server_port):
+
+
+
+def handle_socket_listen(address, port):
+    """
+    Função para criar e gerenciar o socket UDP para escutar.
+    """
+    try:
+        udp_socket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        udp_socket.bind((address, port))  # Associa o socket ao endereço e porta
+        print(f"Socket UDP criado e escutando em {address}:{port}")
+
+        while True:
+            try:
+                data, addr = udp_socket.recvfrom(65535)  # Receber dados com tamanho maior para frames
+                if data:
+                    # Verificar se os dados podem ser decodificados como UTF-8
+                    try:
+                        decoded_data = data.decode('utf-8')  # Tenta decodificar como UTF-8
+                        data_json = json.loads(decoded_data)  # Tenta carregar como JSON
+                        
+                        # Se for JSON, processar conforme o código
+                        if "code" in data_json:
+                            code = data_json["code"]
+                            sender = data_json["sender"]
+                            destination = data_json["destination"]
+
+                            if code == 1:  # Mensagem para reencaminhamento básico
+                                udp_socket.sendto(b"0", addr)  # Envia ACK
+                                print(f"ACK '0' enviado para {addr}")
+
+                                # Reencaminhar mensagem para o próximo nó
+                                if destination in next_hops:
+                                    udp_ip, port_ip = next_hops[destination]
+                                    threading.Thread(
+                                        target=handle_socket_connect,
+                                        args=(udp_ip, port_ip, sender, destination, 1),
+                                        daemon=True
+                                    ).start()
+                                else:
+                                    print(f"Destino desconhecido: {destination}")
+
+                            elif code == 2:  # Mensagem de streams recebida
+                                streams = data_json.get("streams", [])
+                                udp_socket.sendto(b"0", addr)  # Envia ACK
+                                print(f"ACK '0' enviado para {addr}")
+                                print(f"Streams recebidas: {streams}")
+
+                                # Reencaminhar streams para o próximo nó
+                                if destination in next_hops:
+                                    udp_ip, port_ip = next_hops[destination]
+                                    threading.Thread(
+                                        target=handle_socket_connect,
+                                        args=(udp_ip, port_ip, sender, destination, 2, streams),
+                                        daemon=True
+                                    ).start()
+                                else:
+                                    print(f"Destino desconhecido: {destination}")
+
+                            elif code == 3:  # Solicitação de stream
+                                udp_socket.sendto(b"0", addr)  # Envia ACK
+                                stream = data_json["stream"]
+
+                                # Reencaminhar stream para o próximo nó
+                                if destination in next_hops:
+                                    udp_ip, port_ip = next_hops[destination]
+                                    threading.Thread(
+                                        target=handle_socket_connect,
+                                        args=(udp_ip, port_ip, sender, destination, 3, None, stream),
+                                        daemon=True
+                                    ).start()
+                                else:
+                                    print(f"Destino desconhecido: {destination}")
+
+                    except (UnicodeDecodeError, json.JSONDecodeError):
+                        try:
+                            # Extraindo as partes do cabeçalho
+                            destination = data[:3].decode("utf-8").strip()
+                            sender = data[3:6].decode("utf-8").strip()
+                            payload = data[6:]
+
+                            next_ip, next_port = next_hops[destination]
+
+                            threading.Thread(
+                                        target=forward_frame,
+                                        args=(next_ip, next_port, data),
+                                        daemon=True
+                                    ).start()
+
+                        except Exception as e:
+                            print(f"Erro ao salvar frame: {e}")
+
+            except Exception as e:
+                print(f"Erro ao receber dados no socket UDP: {e}")
+
+    except Exception as e:
+        print(f"Erro ao criar socket UDP para escuta: {e}")
+    finally:
+        udp_socket.close()
+        print(f"Socket UDP fechado em {address}:{port}")
+
+
+def forward_frame(address, port, data):
+    """
+    Função para reencaminhar pacotes RTP (código 4) para o próximo nó.
+    """
+    try:
+        if control:
+            port+=1
+        udp_socket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        udp_socket.settimeout(1.0)  # Configura timeout para 1 segundo
+        udp_socket.connect((address, port))
+
+        udp_socket.send(data)
+       
+
+    except Exception as e:
+        print(f"Erro ao reencaminhar frame para {address}:{port}: {e}")
+    finally:
+        udp_socket.close()
+    
+def handle_socket_connect(address, port, sender, destination, code, streams=None,stream=None):
+    """
+    Função para criar e gerenciar o socket UDP para conexão.
+    Inclui lógica para enviar mensagens e, no caso de 'code == 2', as streams recebidas.
+    """
+    try:
+        udp_socket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        udp_socket.settimeout(1.0)  # Configura o timeout para 1 segundo
+        udp_socket.connect((address, port))
+        print(f"Conectado ao socket UDP no endereço {address}:{port}")
+
+        # Prepara a mensagem inicial para envio
+        message = {
+            "code": code,
+            "sender": sender,
+            "destination": destination
+        }
+        if streams:  # Adicionar streams se existirem
+            message["streams"] = streams
+
+        if stream:
+            message["stream"] = stream
+
+        message_encoded = json.dumps(message).encode()
+
+        ack_received = False
+        max_retries = 5  # Define o número máximo de tentativas
+        retries = 0
+
+        while not ack_received and retries < max_retries:
+            # Envia a mensagem inicial
+            udp_socket.send(message_encoded)
+            print(f"Mensagem enviada para {address}:{port}: {message} (tentativa {retries + 1})")
+
+            try:
+                # Aguardar ACK
+                response = udp_socket.recv(1024).decode()
+                print(f"Resposta recebida: {response}")
+
+                if response == "0":
+                    print("ACK (0) recebido com sucesso!")
+                    ack_received = True
+                else:
+                    print(f"Resposta inesperada recebida: {response}")
+
+            except socket.timeout:
+                print(f"Timeout ao aguardar ACK. Reenviando a mensagem...")
+                retries += 1
+
+        if not ack_received:
+            print(f"Falha ao receber ACK após múltiplas tentativas.")
+
+    except Exception as e:
+        print(f"Erro ao conectar ao socket UDP: {e}")
+    finally:
+        udp_socket.close()
+        print("Socket fechado.")
+
+
+def server_con(server_host, server_port, timeout=5):
     """
     Conecta ao servidor via TCP para obter streams disponíveis,
-    encerra a conexão e calcula o RTT via UDP.
+    encerra a conexão e calcula o RTT via UDP, enviando ping continuamente até receber pong.
     """
     try:
         # Criar uma conexão TCP inicial para obter informações
         tcp_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         tcp_socket.connect((server_host, server_port))
-        print(f"Connected to server at {server_host}:{server_port} via TCP")
 
         response = tcp_socket.recv(1024).decode()
-
-        # Encerra a conexão TCP
         tcp_socket.close()
-        
 
         # Inicia a conexão UDP para calcular RTT
         udp_socket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        udp_socket.settimeout(timeout)  # Define o timeout de 5 segundos
         udp_socket.connect((server_host, server_port))
 
-        # Calcular RTT enviando um "ping"
-        start_time = time.time()
-        udp_socket.send(b"ping")  # Enviar mensagem "ping"
-        data, addr = udp_socket.recvfrom(1024)  # Aguarda resposta "pong"
-        end_time = time.time()
+        while True:  # Loop até receber o "pong"
+            start_time = time.time()
+            udp_socket.send(b"ping")  # Envia mensagem "ping"
 
-        if data and data.decode() == "pong":
-            rtt = (end_time - start_time) * 1000  # RTT em milissegundos
-            return rtt
-
-        else:
-            print("No valid response received for RTT calculation.")
-
-        # Fechar a conexão UDP
-        udp_socket.close()
-        print("UDP connection closed.")
-
-        return None
+            try:
+                data, addr = udp_socket.recvfrom(1024)  # Aguarda resposta "pong"
+                if data and data.decode() == "pong":
+                    end_time = time.time()
+                    rtt = (end_time - start_time) * 1000  # RTT em milissegundos
+                    udp_socket.close()
+                    print("Received Pong. RTT Calculated:", rtt)
+                    return rtt
+            except socket.timeout:
+                # Se o timeout for atingido, reenvia o "ping"
+                print("Timeout reached. Resending Ping...")
+                continue
 
     except Exception as e:
         print(f"Error in server_con: {e}")
-
+        return None
 
 
 def listen_for_connections(host, port):
@@ -376,7 +553,7 @@ def connect_to_pc_bind(pc_address, pc_port):
         print(f"UDP socket bound to {pc_address}:{pc_port}")
 
         first_message = True  # Indica se é a primeira mensagem
-        global pedido
+        control.append(1)
         while True:
             try:
                 # Aguarda a mensagem
@@ -399,6 +576,7 @@ def connect_to_pc_bind(pc_address, pc_port):
                         print(f"Resposta 'pong' enviada para {addr}")
                         first_message = True 
                         udp_socket.settimeout(None) 
+
                     elif message == 1:
                         udp_socket.sendto(b"0", addr)
                         sender = data_json["sender"]
@@ -408,13 +586,122 @@ def connect_to_pc_bind(pc_address, pc_port):
                         print(f"Resposta '0' enviada para {addr}")
                         first_message = True 
                         udp_socket.settimeout(None) 
-                    
 
+                    elif message == 3:
+                        udp_socket.sendto(b"0", addr)
+                        sender = data_json["sender"]
+                        stream = data_json["stream"]
+                        destination = data_json["destination"]
+                        udp_ip, port_ip = next_hops[destination]  # Pega o próximo salto
+
+                        threading.Thread(
+                            target=handle_socket_connect,
+                            args=(udp_ip, port_ip, sender, destination, 3,None,stream),
+                            daemon=True
+                        ).start()
+
+                        first_message = True 
+                        udp_socket.settimeout(None) 
+                    
             except socket.timeout:
                 pass
 
     except Exception as e:
         print(f"Falha ao criar socket UDP para o PC no endereço {pc_address}:{pc_port}: {e}")
+    finally:
+        udp_socket.close()
+        print("Socket UDP encerrado.")
+
+
+def connect_to_pc(pc_address, pc_port):
+    """
+    Conecta-se ao PC usando UDP, escuta mensagens e responde com "pong" ao receber "ping".
+    A primeira mensagem é enviada para o cliente, que deve responder com um ACK.
+    Após o ACK, o servidor ativa um timeout de 1 segundo para as mensagens subsequentes.
+    """
+
+
+    try:
+        udp_socket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        udp_socket.connect((pc_address, pc_port))  # Estabelece a conexão com o PC
+        print(f"Conectado ao PC no endereço {pc_address}:{pc_port}")
+
+        # Envia a primeira mensagem informando que o servidor está ativo
+        first_message = {
+            "code": 0,  # Indicando que o servidor está ativo
+        }
+        udp_socket.send(json.dumps(first_message).encode())  # Envia a mensagem inicial
+        print(f"Primeira mensagem enviada para {pc_address}:{pc_port}")
+
+        # Configura timeout de 1 segundo para as mensagens subsequentes
+        udp_socket.settimeout(1.0)  # Timeout para espera de respostas subsequentes
+
+        # Espera pelo ACK do cliente após a primeira mensagem
+        ack_received = False
+        while not ack_received:
+            try:
+                data, addr = udp_socket.recvfrom(1024)  # Aguardar pela resposta do cliente
+                data_json = json.loads(data.decode())
+
+                if data_json.get("code") == 0:  # Verifica se o ACK foi recebido
+                    print("ACK recebido do cliente. Continuando a comunicação...")
+                    ack_received = True
+                else:
+                    print(f"Mensagem inesperada recebida: {data_json}")
+
+            except socket.timeout:
+                print("Timeout: Nenhum ACK recebido, reenviando a primeira mensagem...")
+                udp_socket.send(json.dumps(first_message).encode())  # Reenviar a primeira mensagem
+
+        # Após o ACK, o servidor começa a receber e responder às mensagens do cliente
+        while True:
+            try:
+                data, addr = udp_socket.recvfrom(1024)  # Aguardar a próxima mensagem do cliente
+                data_json = json.loads(data.decode())
+                message = data_json.get("code")
+                if message is not None:
+                    print(f"Mensagem recebida do cliente {addr}: {message}")
+
+                    # Verifica se a mensagem é "ping" e responde com "pong"
+                    if message == 0:
+                        udp_socket.sendto(b"pong", addr)
+                        print(f"Resposta 'pong' enviada para {addr}")
+                        udp_socket.settimeout(None) 
+                    elif message == 1:
+                        udp_socket.sendto(b"0", addr)  # Envia uma resposta de código "0"
+                        sender = data_json["sender"]
+                        destination = data_json["destination"]
+                        udp_ip, port_ip = next_hops[destination]  # Pega o próximo salto
+
+                        threading.Thread(
+                            target=handle_socket_connect,
+                            args=(udp_ip, port_ip, sender, destination, 1),
+                            daemon=True
+                        ).start()
+    
+                    elif message == 3:
+                        udp_socket.sendto(b"0", addr)
+                        sender = data_json["sender"]
+                        stream = data_json["stream"]
+                        destination = data_json["destination"]
+                        udp_ip, port_ip = next_hops[destination]  # Pega o próximo salto
+
+                        threading.Thread(
+                            target=handle_socket_connect,
+                            args=(udp_ip, port_ip, sender, destination, 3,None,stream),
+                            daemon=True
+                        ).start()
+
+
+            except socket.timeout:
+                # Timeout caso o cliente não responda em tempo
+                print("Timeout: Nenhuma resposta recebida, continuando...")
+
+            except Exception as e:
+                print(f"Erro ao processar mensagem do cliente: {e}")
+
+    except Exception as e:
+        print(f"Falha ao conectar ao PC no endereço {pc_address}:{pc_port}: {e}")
     finally:
         udp_socket.close()
         print("Socket UDP encerrado.")
@@ -441,129 +728,6 @@ def measure_rtt_with_socket(sock):
         return float('inf')
     
 
-def handle_socket_listen(address, port):
-    """
-    Função para criar e gerenciar o socket UDP para escutar.
-    """
-    try:
-        udp_socket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        udp_socket.bind((address, port))  # Associa o socket ao endereço e porta
-        print(f"Socket UDP criado e escutando em {address}:{port}")
-
-        while True:
-            try:
-                data, addr = udp_socket.recvfrom(1024)  # Receber dados
-                if data:
-                    print(f"Mensagem recebida de {addr}: {data.decode('utf-8')}")
-
-                    # Tentar decodificar a mensagem como JSON
-                    try:
-                        data_json = json.loads(data.decode('utf-8'))
-                        code = data_json["code"]
-                        sender = data_json["sender"]
-                        destination = data_json["destination"]
-
-                        if code == 1:  # Mensagem para reencaminhamento básico
-                            udp_socket.sendto(b"0", addr)  # Envia ACK
-                            print(f"ACK '0' enviado para {addr}")
-
-                            # Reencaminhar mensagem para o próximo nó
-                            if destination in next_hops:
-                                udp_ip, port_ip = next_hops[destination]
-                                threading.Thread(
-                                    target=handle_socket_connect,
-                                    args=(udp_ip, port_ip, sender, destination, 1),
-                                    daemon=True
-                                ).start()
-                            else:
-                                print(f"Destino desconhecido: {destination}")
-
-                        elif code == 2:  # Mensagem de streams recebida
-                            streams = data_json.get("streams", [])
-                            udp_socket.sendto(b"0", addr)  # Envia ACK
-                            print(f"ACK '0' enviado para {addr}")
-                            print(f"Streams recebidas: {streams}")
-
-                            # Reencaminhar streams para o próximo nó
-                            if destination in next_hops:
-                                udp_ip, port_ip = next_hops[destination]
-                                threading.Thread(
-                                    target=handle_socket_connect,
-                                    args=(udp_ip, port_ip, sender, destination, 2, streams),
-                                    daemon=True
-                                ).start()
-                            else:
-                                print(f"Destino desconhecido: {destination}")
-                        else:
-                            print(f"Mensagem com código desconhecido recebida de {addr}: {data_json}")
-
-                    except json.JSONDecodeError:
-                        print(f"Erro ao decodificar mensagem JSON de {addr}: {data.decode('utf-8')}")
-
-            except Exception as e:
-                print(f"Erro ao receber dados no socket UDP: {e}")
-
-    except Exception as e:
-        print(f"Erro ao criar socket UDP para escuta: {e}")
-    finally:
-        udp_socket.close()
-        print(f"Socket UDP fechado em {address}:{port}")
-
-
-def handle_socket_connect(address, port, sender, destination, code, streams=None):
-    """
-    Função para criar e gerenciar o socket UDP para conexão.
-    Inclui lógica para enviar mensagens e, no caso de 'code == 2', as streams recebidas.
-    """
-    try:
-        udp_socket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        udp_socket.settimeout(1.0)  # Configura o timeout para 1 segundo
-        udp_socket.connect((address, port))
-        print(f"Conectado ao socket UDP no endereço {address}:{port}")
-
-        # Prepara a mensagem inicial para envio
-        message = {
-            "code": code,
-            "sender": sender,
-            "destination": destination
-        }
-        if streams:  # Adicionar streams se existirem
-            message["streams"] = streams
-
-        message_encoded = json.dumps(message).encode()
-
-        ack_received = False
-        max_retries = 5  # Define o número máximo de tentativas
-        retries = 0
-
-        while not ack_received and retries < max_retries:
-            # Envia a mensagem inicial
-            udp_socket.send(message_encoded)
-            print(f"Mensagem enviada para {address}:{port}: {message} (tentativa {retries + 1})")
-
-            try:
-                # Aguardar ACK
-                response = udp_socket.recv(1024).decode()
-                print(f"Resposta recebida: {response}")
-
-                if response == "0":
-                    print("ACK (0) recebido com sucesso!")
-                    ack_received = True
-                else:
-                    print(f"Resposta inesperada recebida: {response}")
-
-            except socket.timeout:
-                print(f"Timeout ao aguardar ACK. Reenviando a mensagem...")
-                retries += 1
-
-        if not ack_received:
-            print(f"Falha ao receber ACK após múltiplas tentativas.")
-
-    except Exception as e:
-        print(f"Erro ao conectar ao socket UDP: {e}")
-    finally:
-        udp_socket.close()
-        print("Socket fechado.")
 
         
 def connect_to_bootstrapper(host, port):
@@ -620,6 +784,7 @@ def connect_to_bootstrapper(host, port):
                 
                 pc = data_json['pc']
                 pc_interface = data_json['pc_interface']
+                
                 if pc and not pc_interface:
                     pc_ip = my_tcp
                     pc_port = my_port + 1
@@ -627,7 +792,7 @@ def connect_to_bootstrapper(host, port):
                 elif pc and pc_interface:
                     for pc_i in pc_interface:
                         pc_ip, pc_port = pc_i
-                        #threading.Thread(target=connect_to_pc, args=(pc_ip, pc_port+1), daemon=True).start()
+                        threading.Thread(target=connect_to_pc, args=(pc_ip, pc_port+1), daemon=True).start()
 
                 if bootneighbor:
                     # Enviar mensagem com código 0
@@ -659,6 +824,7 @@ def connect_to_bootstrapper(host, port):
                 neighbors_list = data
 
                 bootneighbor = data_json['bootneighbor']
+                print(f"NEIGHBOR: {neighbors_list}")
 
                 # Chama connect_to_neighbors em uma thread
                 threading.Thread(
@@ -704,6 +870,11 @@ def connect_to_bootstrapper(host, port):
                     pc_ip = my_tcp
                     pc_port = my_port + 1
                     threading.Thread(target=connect_to_pc_bind, args=(pc_ip, pc_port), daemon=True).start()
+                elif pc and pc_interface:
+                    for pc_i in pc_interface:
+                        pc_ip, pc_port = pc_i
+                        threading.Thread(target=connect_to_pc, args=(pc_ip, pc_port+1), daemon=True).start()
+
 
             elif message_code == 2:
                 data = data_json['data']
@@ -761,6 +932,11 @@ def connect_to_bootstrapper(host, port):
                     pc_ip = my_tcp
                     pc_port = my_port + 1
                     threading.Thread(target=connect_to_pc_bind, args=(pc_ip, pc_port), daemon=True).start()
+                elif pc and pc_interface:
+                    for pc_i in pc_interface:
+                        pc_ip, pc_port = pc_i
+                        threading.Thread(target=connect_to_pc, args=(pc_ip, pc_port+1), daemon=True).start()
+
                     
             elif message_code == 3:
                 print("No neighbors to connect to.")

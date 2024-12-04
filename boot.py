@@ -4,6 +4,8 @@ import json
 import threading
 from threading import Thread
 import time
+import heapq
+
 
 global_lock = threading.Lock()
 condition = threading.Condition(global_lock)
@@ -57,6 +59,7 @@ next_hops={}
 servers_socket={}
 
 
+
 def handle_socket_listen(address, port):
     """
     Função para criar e gerenciar o socket UDP para escutar.
@@ -66,70 +69,150 @@ def handle_socket_listen(address, port):
         udp_socket.bind((address, port))  # Associa o socket ao endereço e porta
         print(f"Socket UDP criado e escutando em {address}:{port}")
 
-        
-        try:
-            data, addr = udp_socket.recvfrom(1024)
-                # Receber dados
-            if data:
-                print(f"Mensagem recebida de {addr}: {data.decode('utf-8')}")
-                ip,_=addr
-                # Tentar decodificar a mensagem como JSON
-                try:
-                    data_json = json.loads(data.decode('utf-8'))
-                    message  = data_json["code"]
-                    sender = data_json["sender"]
-                    destination = data_json["destination"]
+        while True:
+            try:
+                data, addr = udp_socket.recvfrom(65535)  # Receber dados com tamanho maior para frames
+                if data:
+                    # Verificar se os dados podem ser decodificados como UTF-8
+                    try:
+                        decoded_data = data.decode('utf-8')  # Tenta decodificar como UTF-8
+                        data_json = json.loads(decoded_data)  # Tenta carregar como JSON
+                        
+                        # Se for JSON, processar conforme o código
+                        if "code" in data_json:
+                            code = data_json["code"]
+                            sender = data_json["sender"]
+                            destination = data_json["destination"]
 
-                    if message==1:
-                        udp_socket.sendto(b"0", addr)
-                        sender = data_json["sender"]
-                        destination = data_json["destination"]
-                        udp_ip, port_ip = next_hops[destination]
-                        threading.Thread(target=handle_socket_connect, args = (udp_ip,port_ip,sender,destination),  daemon=True).start()
-                        print(f"Resposta '0' enviada para {addr}")
+                            if code == 1:  # Mensagem para reencaminhamento básico
+                                udp_socket.sendto(b"0", addr)  # Envia ACK
+                                print(f"ACK '0' enviado para {addr}")
 
-                except json.JSONDecodeError:
-                    print(f"Erro ao decodificar mensagem JSON de {addr}: {data.decode('utf-8')}")
+                                # Reencaminhar mensagem para o próximo nó
+                                if destination in next_hops:
+                                    udp_ip, port_ip = next_hops[destination]
+                                    threading.Thread(
+                                        target=handle_socket_connect,
+                                        args=(udp_ip, port_ip, sender, destination, 1),
+                                        daemon=True
+                                    ).start()
+                                else:
+                                    print(f"Destino desconhecido: {destination}")
 
-        except Exception as e:
-            print(f"Erro ao receber dados no socket UDP: {e}")
-        
+                            elif code == 2:  # Mensagem de streams recebida
+                                streams = data_json.get("streams", [])
+                                udp_socket.sendto(b"0", addr)  # Envia ACK
+                                print(f"ACK '0' enviado para {addr}")
+                                print(f"Streams recebidas: {streams}")
+
+                                # Reencaminhar streams para o próximo nó
+                                if destination in next_hops:
+                                    udp_ip, port_ip = next_hops[destination]
+                                    threading.Thread(
+                                        target=handle_socket_connect,
+                                        args=(udp_ip, port_ip, sender, destination, 2, streams),
+                                        daemon=True
+                                    ).start()
+                                else:
+                                    print(f"Destino desconhecido: {destination}")
+
+                            elif code == 3:  # Solicitação de stream
+                                udp_socket.sendto(b"0", addr)  # Envia ACK
+                                stream = data_json["stream"]
+
+                                # Reencaminhar stream para o próximo nó
+                                if destination in next_hops:
+                                    udp_ip, port_ip = next_hops[destination]
+                                    threading.Thread(
+                                        target=handle_socket_connect,
+                                        args=(udp_ip, port_ip, sender, destination, 3, None, stream),
+                                        daemon=True
+                                    ).start()
+                                else:
+                                    print(f"Destino desconhecido: {destination}")
+
+                    except (UnicodeDecodeError, json.JSONDecodeError):
+                        try:
+                            # Extraindo as partes do cabeçalho
+                            destination = data[:3].decode("utf-8").strip()
+                            sender = data[3:6].decode("utf-8").strip()
+                            payload = data[6:]
+
+                            next_ip, next_port = next_hops[destination]
+
+                            threading.Thread(
+                                        target=forward_frame,
+                                        args=(next_ip, next_port,data),
+                                        daemon=True
+                                    ).start()
+                        except Exception as e:
+                            print(f"Erro ao salvar frame: {e}")
+
+            except Exception as e:
+                print(f"Erro ao receber dados no socket UDP: {e}")
+
     except Exception as e:
         print(f"Erro ao criar socket UDP para escuta: {e}")
     finally:
         udp_socket.close()
         print(f"Socket UDP fechado em {address}:{port}")
 
+
+
+def forward_frame(address, port, data):
+    """
+    Função para reencaminhar pacotes RTP (código 4) para o próximo nó.
+    """
+    try:
+        if control:
+            port+=1
+        udp_socket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        udp_socket.settimeout(1.0)  # Configura timeout para 1 segundo
+        udp_socket.connect((address, port))
+
+        udp_socket.send(data)
+       
+
+    except Exception as e:
+        print(f"Erro ao reencaminhar frame para {address}:{port}: {e}")
+    finally:
+        udp_socket.close()
     
 
-def handle_socket_connect(address, port, sender, destination):
+def handle_socket_connect(address, port, sender, destination, code, streams=None,stream=None):
     """
     Função para criar e gerenciar o socket UDP para conexão.
-    Inclui lógica para aguardar ACK (0) após enviar uma mensagem.
+    Inclui lógica para enviar mensagens e, no caso de 'code == 2', as streams recebidas.
     """
     try:
         udp_socket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         udp_socket.settimeout(1.0)  # Configura o timeout para 1 segundo
-        udp_socket.connect((address, port)) 
+        udp_socket.connect((address, port))
         print(f"Conectado ao socket UDP no endereço {address}:{port}")
 
-        # Prepara a mensagem para envio
-        message = json.dumps({
-            "code": 1,  # Tipo de mensagem
+        # Prepara a mensagem inicial para envio
+        message = {
+            "code": code,
             "sender": sender,
             "destination": destination
-        })
-        message_encoded = message.encode()
-        
+        }
+        if streams:  # Adicionar streams se existirem
+            message["streams"] = streams
+
+        if stream:
+            message["stream"] = stream
+
+        message_encoded = json.dumps(message).encode()
+
         ack_received = False
         max_retries = 5  # Define o número máximo de tentativas
         retries = 0
 
         while not ack_received and retries < max_retries:
-            # Envia a mensagem
+            # Envia a mensagem inicial
             udp_socket.send(message_encoded)
-            print(f"Mensagem enviada: {message} (tentativa {retries + 1})")
-            
+            print(f"Mensagem enviada para {address}:{port}: {message} (tentativa {retries + 1})")
+
             try:
                 # Aguardar ACK
                 response = udp_socket.recv(1024).decode()
@@ -142,18 +225,18 @@ def handle_socket_connect(address, port, sender, destination):
                     print(f"Resposta inesperada recebida: {response}")
 
             except socket.timeout:
-                print("Timeout ao aguardar ACK. Reenviando a mensagem...")
+                print(f"Timeout ao aguardar ACK. Reenviando a mensagem...")
                 retries += 1
 
         if not ack_received:
-            print("Falha ao receber ACK após múltiplas tentativas.")
+            print(f"Falha ao receber ACK após múltiplas tentativas.")
 
     except Exception as e:
         print(f"Erro ao conectar ao socket UDP: {e}")
-
     finally:
         udp_socket.close()
         print("Socket fechado.")
+
 
 
 def calculate_dijkstra_tree(start_node, graph):
@@ -161,7 +244,6 @@ def calculate_dijkstra_tree(start_node, graph):
     Calcula a árvore de menor caminho a partir de um nó inicial (start_node) usando o algoritmo de Dijkstra.
     Retorna um dicionário que mapeia cada nó ao seu nó pai na árvore gerada e as distâncias.
     """
-    import heapq
 
     distances = {node: float('inf') for node in graph}
     parent = {node: None for node in graph}
@@ -260,9 +342,9 @@ def check_stream_path():
 
             # Calcula a árvore de menor caminho
             parent, distances = calculate_dijkstra_tree("S", rtt_weights)
-            print("Árvore de menor caminho gerada:")
-            for node, parent_node in parent.items():
-                print(f"{node} <- {parent_node} (Distância: {distances[node]})")
+            # print("Árvore de menor caminho gerada:")
+            # for node, parent_node in parent.items():
+            #     print(f"{node} <- {parent_node} (Distância: {distances[node]})")
 
             # Determinar o melhor caminho de cada PC para o servidor S
             for pc in pcs:
@@ -298,7 +380,7 @@ def check_stream_path():
                     nodes_local = [node for node in nodes.keys() if node.startswith("S")]
                     for node in nodes_local:
                         for key,entries in routing_table.items():
-                            for entry in entries: 
+                            for entry in entries:
                                 # Itera sobre cada dicionário na lista de entradas
                                 destination_nodes = entry["destinations"]  # Extrai os destinos
                                 next_hop = entry["next_hop"]  # Extrai o próximo salto
@@ -388,9 +470,9 @@ def check_stream_path():
 
             # Calcula a árvore de menor caminho imediatamente
             parent, distances = calculate_dijkstra_tree("S", rtt_weights)
-            print("Árvore de menor caminho gerada nesta rodada:")
-            for node, parent_node in parent.items():
-                print(f"{node} <- {parent_node} (Distância: {distances[node]})")
+            # print("Árvore de menor caminho gerada nesta rodada:")
+            # for node, parent_node in parent.items():
+            #     print(f"{node} <- {parent_node} (Distância: {distances[node]})")
 
             # Determinar o melhor caminho de cada PC para o servidor S
             for pc in pcs:
@@ -426,7 +508,7 @@ def check_stream_path():
                     nodes_local = [node for node in nodes.keys() if node.startswith("S")]
                     for node in nodes_local:
                         for key,entries in routing_table.items():
-                            for entry in entries: 
+                            for entry in entries:
                                 # Itera sobre cada dicionário na lista de entradas
                                 destination_nodes = entry["destinations"]  # Extrai os destinos
                                 next_hop = entry["next_hop"]  # Extrai o próximo salto
@@ -635,11 +717,14 @@ def handle_node_connection(conn, addr):
                                         min_interface = min(interfaces, key=lambda x: x[1])
                                     selected_interfaces.append(min_interface)
 
-                if len(selected_interfaces) == 0:
+                if len(selected_interfaces) == 0 :
                     data_to_send = [addr[0], port]
                     message_code = 0
-                elif count == len(neighbors):  
+                elif count == len(neighbors) and not node.startswith("PC"):  
                     data_to_send = selected_interfaces
+                    message_code = 1
+                elif count == len(neighbors) and node.startswith("PC"):  
+                    data_to_send = [selected_interfaces, [addr[0], port]]
                     message_code = 1
                 else:
                     data_to_send = [selected_interfaces, [addr[0], port]]
@@ -651,7 +736,9 @@ def handle_node_connection(conn, addr):
                 my_udp = [addr[0], port+5]
                 control[node]=(message_code,selected_interfaces)
                 
+                
                 complete_message = json.dumps({"code": message_code, "bootneighbor":bootneighbor ,"node": node ,"data": data_to_send, "pc": pc, "pc_interface": pc_interface, "my_udp": my_udp, "server":server})
+                print(f"Message sent to {addr[0]}")
                 conn.send(complete_message.encode('utf-8'))
 
             else:
@@ -678,7 +765,7 @@ def handle_node_connection(conn, addr):
                     pc_interface = []
                     for neighbor in neighbors:
                         if neighbor.startswith("PC"):
-                                pc = 1
+                            pc = 1
                         if neighbor in nodes_connected:
                             if neighbor == boot_name or neighbor.startswith("S"):
                                 if neighbor.startswith("S"):
@@ -722,11 +809,14 @@ def handle_node_connection(conn, addr):
                                             min_interface = min(interfaces, key=lambda x: x[1])
                                         selected_interfaces.append(min_interface)
 
-                    if len(selected_interfaces) == 0:
+                    if len(selected_interfaces) == 0 :
                         data_to_send = [addr[0], port]
                         message_code = 0
-                    elif count == len(neighbors):
+                    elif count == len(neighbors) and not node.startswith("PC"):  
                         data_to_send = selected_interfaces
+                        message_code = 1
+                    elif count == len(neighbors) and node.startswith("PC"):  
+                        data_to_send = [selected_interfaces, [addr[0], port]]
                         message_code = 1
                     else:
                         data_to_send = [selected_interfaces, [addr[0], port]]
@@ -737,6 +827,7 @@ def handle_node_connection(conn, addr):
 
                     control[node]=(message_code,selected_interfaces)
                     my_udp = [addr[0], port+5]
+                    
 
                 complete_message = json.dumps({"code": message_code, "bootneighbor":bootneighbor ,"node": node ,"data": data_to_send, "pc": pc, "pc_interface": pc_interface, "my_udp": my_udp, "server":server})
                 conn.send(complete_message.encode('utf-8'))
@@ -837,7 +928,7 @@ def handle_node_connection(conn, addr):
         while True:
             with start_tree_lock:
                 start_tree_condition.wait()
-                print(f"TABELA DE ROUTING: {routing_table}")
+                #print(f"TABELA DE ROUTING: {routing_table}")
 
                 node = find_ip(addr[0])
                 server = None
@@ -848,21 +939,31 @@ def handle_node_connection(conn, addr):
                             next_hop = entry["next_hop"]  # Extrai o próximo salto
                             if key.startswith("S"):
                                 server=key
-                            if key == node and next_hop.startswith("O"):  # Verifica se o nó atual é o próximo salto
+                            if key == node and (next_hop.startswith("O") or next_hop.startswith("PC")):  # Verifica se o nó atual é o próximo salto
                                 # Busca a interface (IP e porta) do próximo salto no dicionário de nós
                                 next_hop_interfaces = nodes.get(next_hop, [])
                                 next_hop_interface = next((ip, port) for ip, port in next_hop_interfaces if port != 0)
 
                                 if next_hop_interface:
                                     next_hop_ip, next_hop_port = next_hop_interface
-                                    message = json.dumps({
-                                        "type": 1,  # Tipo de mensagem 1
-                                        "data": {
-                                            "address": next_hop_ip,
-                                            "port": next_hop_port + 5,  # Porta incrementada em 5
-                                            "destinations": [node for node in destination_nodes] 
-                                        }
-                                    })
+                                    if next_hop.startswith("PC"):
+                                        message = json.dumps({
+                                            "type": 1,  # Tipo de mensagem 1
+                                            "data": {
+                                                "address": next_hop_ip,
+                                                "port": next_hop_port+2,  # Porta incrementada em 2
+                                                "destinations": [node for node in destination_nodes] 
+                                            }
+                                        })
+                                    else:
+                                        message = json.dumps({
+                                            "type": 1,  # Tipo de mensagem 1
+                                            "data": {
+                                                "address": next_hop_ip,
+                                                "port": next_hop_port + 5,  # Porta incrementada em 5
+                                                "destinations": [node for node in destination_nodes] 
+                                            }
+                                        })
                                     
                                     print(f"Nó {node} enviando mensagem do tipo 1 para próximo salto {next_hop} com destinos {destination_nodes}: {message}")
                                     conn.send(message.encode('utf-8'))
@@ -893,12 +994,13 @@ def handle_node_connection(conn, addr):
                                             }
                                         })
                                     
-                                    print(f"Nó {node} enviando mensagem do tipo 1 para próximo salto {next_hop} com destinos {destination_nodes}: {message}")
+                                    print(f"Nó {node} enviando mensagem do tipo 2 para próximo salto {next_hop} com destinos {destination_nodes}: {message}")
                                     conn.send(message.encode('utf-8'))
 
     finally:
         conn.close()
         print(f"Conexão com {addr} encerrada.")
+
 
 def initialize_rtt_weights():
     """
@@ -975,44 +1077,49 @@ def server_con(server_host, server_port, bootstrapper_host):
 
         # Inicia a conexão UDP para calcular RTT
         udp_socket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        udp_socket.settimeout(2)  # Define o timeout de 5 segundos
         udp_socket.connect((server_host, server_port))
 
-        # Calcular RTT enviando um "ping"
-        start_time = time.time()
-        udp_socket.send(b"ping")  # Enviar mensagem "ping"
-        data, addr = udp_socket.recvfrom(1024)  # Aguarda resposta "pong"
-        end_time = time.time()
+        while True:  # Loop até receber o "pong"
+            start_time = time.time()
+            udp_socket.send(b"ping")  # Envia mensagem "ping"
 
-        if data and data.decode() == "pong":
-            rtt = (end_time - start_time) * 1000  # RTT em milissegundos
-            
-            # Resolver o nome do cliente e do servidor
-            server_name = find_ip(server_host)
-            client_name = find_ip(bootstrapper_host)
+            try:
+                data, addr = udp_socket.recvfrom(1024)  # Aguarda resposta "pong"
+                end_time = time.time()
+                if data and data.decode() == "pong":
+                    rtt = (end_time - start_time) * 1000  # RTT em milissegundos
+                    
+                    # Resolver o nome do cliente e do servidor
+                    server_name = find_ip(server_host)
+                    client_name = find_ip(bootstrapper_host)
 
-            if not server_name or not client_name:
-                print(f"Erro ao resolver nomes: server_name={server_name}, client_name={client_name}")
-                return
+                    if not server_name or not client_name:
+                        print(f"Erro ao resolver nomes: server_name={server_name}, client_name={client_name}")
+                        return
 
-            with global_lock:
-                # Garante que os nós existam no dicionário antes de adicionar o RTT
-                if server_name not in rtt_weights:
-                    rtt_weights[server_name] = {}
-                if client_name not in rtt_weights:
-                    rtt_weights[client_name] = {}
+                    with global_lock:
+                        # Garante que os nós existam no dicionário antes de adicionar o RTT
+                        if server_name not in rtt_weights:
+                            rtt_weights[server_name] = {}
+                        if client_name not in rtt_weights:
+                            rtt_weights[client_name] = {}
 
-                # Atualiza os valores no dicionário
-                rtt_weights[client_name][server_name] = rtt / 2  # One-way delay
-                rtt_weights[server_name][client_name] = rtt / 2  # Bidirecional
-                print("RTT weights atualizado:")
-                print(rtt_weights)
-        else:
-            print("No valid response received for RTT calculation.")
+                        # Atualiza os valores no dicionário
+                        rtt_weights[client_name][server_name] = rtt / 2  # One-way delay
+                        rtt_weights[server_name][client_name] = rtt / 2  # Bidirecional
+                    break
+                else:
+                    print("No valid response received for RTT calculation.")
 
-        # Fechar a conexão UDP
-        udp_socket.close()
-        print("UDP connection closed.")
-
+                # Fechar a conexão UDP
+                udp_socket.close()
+                print("UDP connection closed.")
+                
+            except socket.timeout:
+                # Se o timeout for atingido, reenvia o "ping"
+                print("Timeout reached. Resending Ping...")
+                continue
     except Exception as e:
         print(f"Error in server_con: {e}")
 
