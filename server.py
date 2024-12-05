@@ -1,4 +1,3 @@
-# pylint: disable=invalid-name
 import json
 import socket
 import subprocess
@@ -12,10 +11,13 @@ from packets.rtp_packet import RtpPacket
 from PIL import Image
 from io import BytesIO
 
-
+stop_stream_lock = threading.Lock()
 # Lista de vídeos e portas onde cada um será transmitido
 videos = {}
 next_hops={}
+stop_stream_destination=[]
+stream_active=[]
+client_requesting_stream={}
 
 def stream_video(file, ip, port):
     """
@@ -37,44 +39,31 @@ def stream_video(file, ip, port):
     subprocess.run(ffmpeg_command)
 
 def handle_client_connection(conn, addr):
-    """
-    Manipula a conexão TCP inicial com o cliente para enviar streams disponíveis.
-    """
-    try:
-        # Enviar a lista inicial de streams disponíveis
-        response = ",".join(videos.keys())
-        conn.send(response.encode('utf-8'))
-        print(f"Sent available streams to {addr}: {response}")
+    while True:
+        try:
+            data_encoded = conn.recv(1024).decode()
+            if data_encoded:
+                data_json = json.loads(data_encoded)
+                print(f"Received data: {data_json}")
 
-        while True:
-            try:
-                data_encoded = conn.recv(1024).decode()
-                if data_encoded:
-                    data_json = json.loads(data_encoded)
-                    print(f"Received data: {data_json}")
+                # Identificar o tipo da mensagem
+                message_code = data_json['type']  # Tipo da mensagem (0 ou 1)
+                data = data_json['data']
+                address = data['address']  # IP recebido
+                port = data['port']   
+                destinations = data['destinations']     # Porta recebida
+                if message_code == 1:  # Mensagem do tipo 1
+                    for d in destinations:
+                        if d not in next_hops or next_hops[d] != address:
+                            next_hops[d] = (address,port)
+                            print(f"Destino {d} próximo passo {address} na porta {port}")
 
-                    # Identificar o tipo da mensagem
-                    message_code = data_json['type']  # Tipo da mensagem (0 ou 1)
-                    data = data_json['data']
-                    address = data['address']  # IP recebido
-                    port = data['port']   
-                    destinations = data['destinations']     # Porta recebida
-                    if message_code == 1:  # Mensagem do tipo 1
-                        for d in destinations:
-                            if d not in next_hops or next_hops[d] != address:
-                                next_hops[d] = (address,port)
-                                print(f"Destino {d} próximo passo {address} na porta {port}")
-
-            except json.JSONDecodeError:
-                print(f"Erro ao decodificar mensagem JSON de {addr}: {data.decode('utf-8')}")
-            except Exception as e:
+        except json.JSONDecodeError:
+            print(f"Erro ao decodificar mensagem JSON de {addr}")
+        except Exception as e:
                 print(f"Erro ao processar a mensagem de {addr}: {e}")
 
-    except Exception as e:
-        print(f"Erro ao manipular conexão com o cliente {addr}: {e}")
-    finally:
-        conn.close()
-        print(f"Conexão TCP com {addr} encerrada.")
+    
 
 def handle_socket_connect(address, port, sender, destination, code, streams=None):
     """
@@ -179,28 +168,46 @@ def handle_udp_from_pcs(server_host, server_port):
                                 
                                 # Verifica se o vídeo solicitado está disponível
                                 stream = data_json.get("stream")
-                                if stream in videos:  # Verifica se a stream está no servidor
-                                    print(f"Iniciando streaming da stream '{stream}' para {destination} via {sender}")
 
-                                    # Verifica se o próximo nó está definido no dicionário next_hops
-                                    if sender in next_hops:
-                                        next_hop_ip, next_hop_port = next_hops[sender]  # Obtém o próximo nó
-                                        print(f"Próximo nó: {next_hop_ip}:{next_hop_port}")
+                                if stream not in client_requesting_stream.keys():
+                                    with stop_stream_lock:
+                                        client_requesting_stream[stream] = []
+                                        client_requesting_stream[stream].append(sender)
+                                    
+                                    if stream in videos:  # Verifica se a stream está no servidor
+                                        print(f"Iniciando streaming da stream '{stream}' para {sender} via {destination}")
 
-                                        # Inicia a thread para enviar o streaming para o próximo nó
-                                        threading.Thread(
-                                            target=send_stream,
-                                            args=(stream, next_hop_ip, next_hop_port, destination, sender),
-                                            daemon=True
-                                        ).start()
+                                        # Verifica se o próximo nó está definido no dicionário next_hops
+                                        if sender in next_hops:
+                                            next_hop_ip, next_hop_port = next_hops[sender]  # Obtém o próximo nó
+                                            print(f"Próximo nó: {next_hop_ip}:{next_hop_port}")
+
+                                            # Inicia a thread para enviar o streaming para o próximo nó
+                                            threading.Thread(
+                                                target=send_stream,
+                                                args=(stream, next_hop_ip, next_hop_port, destination, sender),
+                                                daemon=True
+                                            ).start()
+                                        else:
+                                            print(f"Sender '{sender}' não encontrado em next_hops.")
+                                            error_msg = {"code": 404, "error": f"Sender '{sender}' não encontrado em next_hops"}
+                                            udp_socket.sendto(json.dumps(error_msg).encode(), addr)
                                     else:
-                                        print(f"Sender '{sender}' não encontrado em next_hops.")
-                                        error_msg = {"code": 404, "error": f"Sender '{sender}' não encontrado em next_hops"}
+                                        print(f"Stream '{stream}' não encontrada no servidor.")
+                                        error_msg = {"code": 404, "error": f"Stream '{stream}' não encontrada no servidor"}
                                         udp_socket.sendto(json.dumps(error_msg).encode(), addr)
                                 else:
-                                    print(f"Stream '{stream}' não encontrada no servidor.")
-                                    error_msg = {"code": 404, "error": f"Stream '{stream}' não encontrada no servidor"}
-                                    udp_socket.sendto(json.dumps(error_msg).encode(), addr)
+                                    with stop_stream_lock:
+                                        client_requesting_stream[stream].append(sender)
+                                    
+                            elif code == 6:
+                                udp_socket.sendto(b"0", addr)
+                                sender = data_json.get("sender")
+                                stream = data_json.get("stream")
+                                with stop_stream_lock:
+                                    client_requesting_stream[stream].remove(sender)
+                                    
+
                             else:
                                 print(f"Mensagem JSON com código desconhecido recebida de {addr}: {data_json}")
 
@@ -221,29 +228,35 @@ def send_stream(stream, next_hop_ip, next_hop_port, sender, destination):
     video = VideoStream("Videos/" + stream)
     try:
         frame_number = 0
-
+        d=[]
         while True:
-            time.sleep(0.05)  # Pausa entre frames para simular streaming em tempo real
-            
-            # Obter próximo frame usando .get_next_frame()
-            frame_data = video.get_next_frame()
+            with stop_stream_lock:
+                values_list = client_requesting_stream.get(stream)
+                for value in values_list:
+                    d.append(value)
+                if not d:
+                    break
+            for dest in d:
+                time.sleep(0.05)  # Pausa entre frames para simular streaming em tempo real
+                
+                # Obter próximo frame usando .get_next_frame()
+                frame_data = video.get_next_frame()
 
-            # Construir o cabeçalho (reserva o número exato de bytes para cada campo)
-            destination_bytes = destination.encode("utf-8").ljust(3, b'\x00')  # Máximo 3 bytes, preenchendo com '\x00'
-            sender_bytes = sender.encode("utf-8").ljust(3, b'\x00')  # Máximo 3 bytes, preenchendo com '\x00'
+                # Construir o cabeçalho (reserva o número exato de bytes para cada campo)
+                destination_bytes = dest.encode("utf-8").ljust(3, b'\x00')  # Máximo 3 bytes, preenchendo com '\x00'
+                sender_bytes = sender.encode("utf-8").ljust(3, b'\x00')  # Máximo 3 bytes, preenchendo com '\x00'
 
-            # Criar pacote RTP com o payload
-            rtp_packet = make_rtp_packet(frame_data, frame_number)
+                # Criar pacote RTP com o payload
+                rtp_packet = make_rtp_packet(frame_data, frame_number)
 
-            # Pacote final (cabeçalho + pacote RTP)
-            packet = destination_bytes + sender_bytes + rtp_packet
-            
-            # Enviar pacote para o próximo nó
-            with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as send_socket:
-                send_socket.sendto(packet, (next_hop_ip, next_hop_port))
+                # Pacote final (cabeçalho + pacote RTP)
+                packet = destination_bytes + sender_bytes + rtp_packet
+                # Enviar pacote para o próximo nó
+                with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as send_socket:
+                    send_socket.sendto(packet, (next_hop_ip, next_hop_port))
 
-            frame_number += 1
-
+                frame_number += 1
+                d=[]
     except Exception as e:
         print(f"Erro no streaming da stream '{stream}' para {destination} via {sender}: {e}")
 
@@ -276,6 +289,7 @@ def start_server(ip, port):
 
     # Iniciar o servidor TCP
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as server_socket:
+        server_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         server_socket.bind((ip, port))
         server_socket.listen()
         print(f"Server started at {ip}:{port}, waiting for connections...")

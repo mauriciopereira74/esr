@@ -11,17 +11,25 @@ global pedido
 
 lock_host = threading.Lock()
 condition_lock_host = threading.Condition(lock_host)
+
 lock_neighbor = threading.Lock()
 condition_lock_neighbor = threading.Condition(lock_neighbor)
+
 lock_6 = threading.Lock()
 condition_6 = threading.Condition(lock_6)
+
+lock_next_hop = threading.Lock()
+
+lock_dead_clients = threading.Lock()
+condition_dead_clients = threading.Condition(lock_dead_clients)
+
+
 connections = []
 connection_active_host = []
 connection_neighbor=[]
 next_hops={}
 control=[]
-
-
+dead_clients = []
 
 
 def handle_socket_listen(address, port):
@@ -35,13 +43,13 @@ def handle_socket_listen(address, port):
 
         while True:
             try:
-                data, addr = udp_socket.recvfrom(65535)  # Receber dados com tamanho maior para frames
+                data, addr = udp_socket.recvfrom(65535) 
+                 # Receber dados com tamanho maior para frames
                 if data:
                     # Verificar se os dados podem ser decodificados como UTF-8
                     try:
                         decoded_data = data.decode('utf-8')  # Tenta decodificar como UTF-8
                         data_json = json.loads(decoded_data)  # Tenta carregar como JSON
-                        
                         # Se for JSON, processar conforme o código
                         if "code" in data_json:
                             code = data_json["code"]
@@ -95,6 +103,21 @@ def handle_socket_listen(address, port):
                                 else:
                                     print(f"Destino desconhecido: {destination}")
 
+                            elif code == 6:
+                                udp_socket.sendto(b"0", addr)
+                                sender = data_json["sender"]
+                                destination = data_json["destination"]
+                                stream = data_json["stream"]
+
+                                udp_ip, port_ip = next_hops[destination] 
+
+                                threading.Thread(
+                                    target=handle_socket_connect,
+                                    args=(udp_ip, port_ip, sender, destination, 6,None,stream),
+                                    daemon=True
+                                ).start()
+
+
                     except (UnicodeDecodeError, json.JSONDecodeError):
                         try:
                             # Extraindo as partes do cabeçalho
@@ -133,7 +156,6 @@ def forward_frame(address, port, data):
         udp_socket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         udp_socket.settimeout(1.0)  # Configura timeout para 1 segundo
         udp_socket.connect((address, port))
-
         udp_socket.send(data)
        
 
@@ -300,18 +322,20 @@ def handle_connection(client_socket, host, port, addr):
         connections.remove(client_socket)
         with lock_host:
             connection_active_host.remove(addr)
-            notified = condition_lock_host.wait(timeout=10) 
+            notified = condition_lock_host.wait(timeout=1) 
 
         if(notified):
-            print(f"Ligação com {addr} reestabelecida")
+            pass
         else:
-            print(f"{addr} dado como morto.")
-        print(f"Closing connection with {host}")
+            with lock_dead_clients:
+                dead_clients.append(addr[0])
+                condition_dead_clients.notify_all()
         
+    
 
 
 def setup_heartbeat_connection(host, port):
-
+      # Repetir até conseguir bind na porta
     try:
         server_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         server_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
@@ -320,21 +344,28 @@ def setup_heartbeat_connection(host, port):
         print(f"Heartbeat server listening on {host}:{port}")
 
         client_socket, addr = server_socket.accept()
-        print(f"Heartbeat connection accepted from {host}")
+        print(f"Heartbeat connection accepted from {addr}")
 
-        # Iniciar threads para enviar e receber heartbeats, passando o endereço como argumento
+        # Iniciar threads para enviar e receber heartbeats
         threading.Thread(target=send_heartbeats, args=(client_socket, host), daemon=True).start()
         threading.Thread(target=receive_heartbeats, args=(client_socket, host), daemon=True).start()
+
+        
+    except OSError as e:
+        if "Address already in use" in str(e):
+            pass
+        else:
+            print(f"Unexpected error: {e}")
     except Exception as e:
-        print(f"Error {e}")
+        print(f"Error: {e}")
+        
 
 
 def send_heartbeats(socket, host):
     try:
         while True:
             socket.send(b"heartbeat")
-            #print(f"Heartbeat sent from {host}")
-            time.sleep(2)
+            time.sleep(0.9)
     except Exception as e:
         pass
         #print(f"Error sending heartbeats from {host}: {e}")
@@ -373,7 +404,7 @@ def send_heartbeats_connected(socket, neighbour):
         while True:
             socket.send(b"heartbeat")
             #print(f"Heartbeat sent to {neighbour}")
-            time.sleep(2)
+            time.sleep(0.9)
     except Exception as e:
         pass
     finally:
@@ -495,7 +526,9 @@ def manage_connection(sock, neighbor_ip, base_port):
             print("Reconnection successful, client is alive.")
             connect_to_neighbors_after_reconnection(neighbor_ip, base_port)
         else:
-            print("Failed to reconnect within 3 seconds, client is considered dead.")
+            with lock_dead_clients:
+                dead_clients.append(neighbor_ip)
+                condition_dead_clients.notify_all()
 
 
 def try_reconnect(neighbor_ip, base_port, timeout=3):
@@ -601,7 +634,24 @@ def connect_to_pc_bind(pc_address, pc_port):
                         ).start()
 
                         first_message = True 
-                        udp_socket.settimeout(None) 
+                        udp_socket.settimeout(None)
+
+                    elif message == 6:
+                        udp_socket.sendto(b"0", addr)
+                        sender = data_json["sender"]
+                        destination = data_json["destination"]
+                        stream = data_json["stream"]
+
+                        udp_ip, port_ip = next_hops[destination] 
+
+                        threading.Thread(
+                            target=handle_socket_connect,
+                            args=(udp_ip, port_ip, sender, destination, 6,None,stream),
+                            daemon=True
+                        ).start()
+
+                        first_message = True 
+                        udp_socket.settimeout(None)
                     
             except socket.timeout:
                 pass
@@ -937,38 +987,26 @@ def connect_to_bootstrapper(host, port):
                         pc_ip, pc_port = pc_i
                         threading.Thread(target=connect_to_pc, args=(pc_ip, pc_port+1), daemon=True).start()
 
-                    
             elif message_code == 3:
                 print("No neighbors to connect to.")
 
         else:
             print("No data received from the bootstrapper")
 
-        
+        threading.Thread(target=notify_dead_clients, args=(client_socket,), daemon=True).start()
+
         while True:
             try:
                 data_encoded = client_socket.recv(1024).decode()
+
                 if data_encoded:
                     data_json = json.loads(data_encoded)
                     print(f"Received data: {data_json}")
 
-                    # Identificar o tipo da mensagem
-                    message_code = data_json['type']  # Tipo da mensagem (0 ou 1)
-                    data = data_json['data']
-                    address = data['address']  # IP recebido
-                    port = data['port']   
-                    destinations = data['destinations']     # Porta recebida
-                    if message_code == 1:  # Mensagem do tipo 1
-                        for d in destinations:
-                            if d not in next_hops or next_hops[d] != address:
-                                next_hops[d] = (address,port)
-                                print(f"Destino {d} próximo passo {address} na porta {port}")
-                    elif message_code == 2:
-                        if destinations not in next_hops or next_hops[destinations] != address:
-                            next_hops[destinations] = (address,port)
-                            print(f"Destino {destinations} próximo passo {address} na porta {port}")
-                    else:
-                        print(f"Mensagem com tipo desconhecido recebida: {message_code}")
+                    threading.Thread(
+                        target=lambda: process_message(data_json),
+                        daemon=True
+                    ).start()
 
             except json.JSONDecodeError:
                 print(f"Erro ao decodificar mensagem recebida: {data_encoded}")
@@ -980,6 +1018,62 @@ def connect_to_bootstrapper(host, port):
     finally:
         client_socket.close()
         pass
+
+
+def process_message(data_json):
+    """
+    Código de processamento encapsulado dentro da thread.
+    """
+    try:
+        # Identificar o tipo da mensagem
+        message_code = data_json['type']  # Tipo da mensagem (0 ou 1)
+        data = data_json['data']
+        address = data['address']  # IP recebido
+        port = data['port']
+        destinations = data['destinations']  # Destinos recebidos
+
+        if message_code == 1:  # Mensagem do tipo 1
+            for d in destinations:
+                with lock_next_hop:
+                    if d not in next_hops or next_hops[d] != address:
+                        next_hops[d] = (address, port)
+                        print(f"Destino {d} próximo passo {address} na porta {port}")
+        elif message_code == 2:
+            with lock_next_hop:
+                if destinations not in next_hops or next_hops[destinations] != address:
+                    next_hops[destinations] = (address, port)
+                    print(f"Destino {destinations} próximo passo {address} na porta {port}")
+        else:
+            print(f"Mensagem com tipo desconhecido recebida: {message_code}")
+    except Exception as e:
+        print(f"Erro ao processar mensagem: {e}")
+
+def notify_dead_clients(client_socket):
+    """
+    Monitora nodos mortos e notifica o bootstrapper.
+    """
+    global dead_clients
+    while True:
+        with lock_dead_clients:
+
+            condition_dead_clients.wait()
+            
+            # Processa cada cliente morto
+            for dead_client in dead_clients:
+                try:
+                    
+                    message = {
+                        "code": 5,
+                        "dead_client": dead_client
+                    }
+
+                    client_socket.sendall(json.dumps(message).encode('utf-8'))
+                    print(f"Notificação enviada para o bootstrapper sobre o cliente morto: {dead_client}")
+                except Exception as e:
+                    print(f"Erro ao notificar bootstrapper sobre cliente morto {dead_client}: {e}")
+            # Limpa a lista de clientes mortos
+            dead_clients = []
+
 
 
 if __name__ == "__main__":

@@ -10,8 +10,12 @@ from io import BytesIO
 
 rtt_lock = threading.Lock()
 rtt_condition = threading.Condition(rtt_lock)
+
+
 latencies = {}
 streams=[]
+global node
+global stream_active
 
 
 CACHE_FILE_NAME = "cache-"
@@ -19,10 +23,10 @@ CACHE_FILE_EXT = ".jpg"
 
 
 class StreamClient:
-    def __init__(self, master, host, port):
+    def __init__(self, master, host, port, sock):
         self.master = master
         self.master.protocol("WM_DELETE_WINDOW", self.exit_client)
-
+        self.socket = sock
         self.host = host
         self.port = port+1
         self.stop_event = threading.Event()
@@ -31,8 +35,8 @@ class StreamClient:
 
         self.create_widgets()
 
-        # Criar socket UDP para mensagens
         self.udp_socket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        self.udp_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)  # Permite reutilizar o endereço
         self.udp_socket.bind((host, self.port))
 
         # Inicia a thread para receber frames (mensagens do tipo 4)
@@ -43,26 +47,14 @@ class StreamClient:
         self.label = Label(self.master, height=19)
         self.label.grid(row=0, column=0, columnspan=4, sticky=W + E + N + S, padx=5, pady=5)
 
-        # Botão de saída
-        self.exit_btn = Button(self.master, text="Exit", command=self.exit_client, width=20, padx=3, pady=3)
-        self.exit_btn.grid(row=1, column=2, padx=2, pady=2)
+        self.start_btn = Button(self.master, text="Começar stream", command=self.start_stream, width=20, padx=3, pady=3)
+        self.start_btn.grid(row=1, column=1, padx=2, pady=2)
 
-    def write_frame(self, data):
-        """Salva o frame como arquivo temporário."""
-        cachename = CACHE_FILE_NAME + str(self.session_id) + CACHE_FILE_EXT
-        with open(cachename, "wb") as file:
-            file.write(data)
-        return cachename
+        self.stop_btn = Button(self.master, text="Parar stream", command=self.stop_stream, width=20, padx=3, pady=3)
+        self.stop_btn.grid(row=1, column=2, padx=2, pady=2)
 
-    def update_movie(self, image_file):
-        
-        """Atualiza o frame exibido na GUI."""
-
-        print(image_file)
-        
-        photo = ImageTk.PhotoImage(Image.open(image_file))
-        self.label.configure(image=photo, height=288)
-        self.label.image = photo
+        self.exit_btn = Button(self.master, text="Sair", command=self.exit_client, width=20, padx=3, pady=3)
+        self.exit_btn.grid(row=1, column=3, padx=2, pady=2)
         
 
     def handle_frames(self):
@@ -71,7 +63,6 @@ class StreamClient:
         """
         while True:
             data, addr = self.udp_socket.recvfrom(65525)  # Recebe dados do cliente
-
             # Extração do cabeçalho e do payload
             if len(data) < 6:  # Verifica se há pelo menos o cabeçalho
                 print(f"Pacote inválido recebido de {addr}. Ignorando.")
@@ -87,17 +78,17 @@ class StreamClient:
             except Exception as e:
                 print(f"Erro ao extrair frame_data de {addr}: {e}")
                 continue
-
-            # Exibir o frame na GUI diretamente da memória
-            try:
-                image = Image.open(BytesIO(frame_data))  # Carrega o frame diretamente como um arquivo temporário
-                photo = ImageTk.PhotoImage(image)
-                self.label.configure(image=photo, height=288)
-                self.label.image = photo  # Armazena a referência para evitar garbage collection
-            except Exception as e:
-                print(f"Erro ao exibir o frame na GUI: {e}")
+            if not self.stop_event.is_set():
+                try:
+                    image = Image.open(BytesIO(frame_data))  
+                    photo = ImageTk.PhotoImage(image)
+                    self.label.configure(image=photo, height=288)
+                    self.label.image = photo  # Armazena a referência para evitar garbage collection
+                except Exception as e:
+                    print(f"Erro ao exibir o frame na GUI: {e}")
 
             self.frame_nr += 1
+
 
 
     def extract_frame_data(self, rtp_packet):
@@ -112,20 +103,52 @@ class StreamClient:
         # Ignorar os primeiros 12 bytes do cabeçalho RTP e retornar o payload
         return rtp_packet[header_size:]
 
-       
+
+    def start_stream(self):
+        """Função chamada ao clicar no botão 'Começar stream'."""
+        self.stop_event.clear()  # Permite a exibição dos frames
+        self.stream_running = True
+
+    def stop_stream(self):
+        """Função chamada ao clicar no botão 'Parar stream'."""
+        self.stop_event.set()  # Bloqueia a exibição dos frames
+        self.stream_running = False
+
     def exit_client(self):
         """Fecha o cliente."""
         self.stop_event.set()
-        self.udp_socket.close()
+        self.stream_running = False
+        # Limpa o conteúdo da interface
+        self.label.configure(image='', text="Conexão encerrada.", height=19)
+        self.label.image = None  # Remove a referência à imagem atual
+
+        # Tenta enviar a mensagem de encerramento ao servidor
+        while True:
+            try:
+                message = json.dumps({
+                    "code": 6,
+                    "sender": node,
+                    "stream": stream_active,
+                    "destination": "S"
+                })
+                self.socket.send(message.encode())
+                self.socket.settimeout(1)  # Timeout para o envio
+                data, addr = self.socket.recvfrom(1024)  # Aguarda resposta
+                if data:  # Resposta recebida
+                    ack = data.decode()  # Processa o dado recebido
+                    break  # Sai do loop se o ACK for recebido
+            except socket.timeout:
+                print("Timeout: Sem resposta recebida, reenviando solicitação...")
+            except Exception as e:
+                print(f"Erro ao enviar mensagem de saída: {e}")
+                break
         self.master.destroy()
+        
 
-
-def start(host,port):
+def start(host,port,sock):
     
     root = Tk()
-    print(host)
-    print(port)
-    app = StreamClient(root, host, port)
+    app = StreamClient(root, host, port, sock)
     app.master.title("Stream Client")
     root.mainloop()
 
@@ -181,20 +204,7 @@ def handle_streams(host, port):
     except Exception as e:
         print(f"Erro ao iniciar socket UDP: {e}")
 
-
-def display_frame(frame_data):
-    """
-    Exibe o frame de vídeo no ecrã usando PIL.
-    """
-    try:
-        # Converte os bytes do frame para uma imagem usando PIL
-        frame_image = Image.open(BytesIO(frame_data))
-        frame_image.show()  # Exibe a imagem no visualizador padrão
-    except Exception as e:
-        print(f"Erro ao exibir frame: {e}")
-
-
-def handle_connection(host, port):
+def handle_connection(host, port, my_udp,my_port):
     global calculated_rtt
     global streams
 
@@ -204,6 +214,8 @@ def handle_connection(host, port):
             print(f"UDP socket prepared for {host}:{port}")
 
             sock.settimeout(0.5)  # Configura o timeout de 0.5 segundos
+            
+            rtt=0
 
             while True:
                 try:
@@ -229,9 +241,14 @@ def handle_connection(host, port):
                 rtt_condition.notify_all()
 
             print_menu()
+            global node
+            global stream_active
+            stream_active = None
+
             while True:
-                
+
                 option = input()
+                
                 if option == "1":
                     # Solicitar streams disponíveis
                     sock.settimeout(0.1)  # Set a timeout of 0.5 seconds
@@ -239,10 +256,11 @@ def handle_connection(host, port):
                     while True:
                         try:
                             message = json.dumps({
-                                    "code": 1,  # Tipo de mensagem 2
-                                    "sender": "PC1",
+                                    "code": 1,  # Tipo de mensagem 1
+                                    "sender": node,
                                     "destination":"S"
                             })
+                            
                             sock.send(message.encode())  # Send the request
                             data, addr = sock.recvfrom(1024)  # Wait for a response with a timeout
                             if data:  # If data is received
@@ -264,7 +282,7 @@ def handle_connection(host, port):
                             print("0 - Voltar atrás")
                             print("-------------------------\n")
                             option = input("Escolha uma opção:")
-                            
+
                             if option == "0":
                                 print_menu()
                                 break
@@ -272,7 +290,7 @@ def handle_connection(host, port):
                                 try:
                                     message = json.dumps({
                                             "code": 3,
-                                            "sender": "PC1",
+                                            "sender": node,
                                             "stream": stream_keys[int(option)-1],
                                             "destination": "S"
                                     })
@@ -280,7 +298,9 @@ def handle_connection(host, port):
                                     sock.settimeout(1)  # Send the request
                                     data, addr = sock.recvfrom(1024)  # Wait for a response with a timeout
                                     if data:  # If data is received
-                                        ack = data.decode() # Process the received data
+                                        ack = data.decode()
+                                        start(my_udp,my_port, sock)
+                                        stream_active = stream_keys[int(option)-1]
                                         break  # Exit the loop if acknowledgment is received
                                 except socket.timeout:
                                     print("Timeout: No response received, resending request...")
@@ -309,10 +329,10 @@ def print_menu():
 
 
 
-
-
 def handle_message(data):
+    global node
     message_code = data['code']
+    node = data['node']
     print(message_code)
     if message_code == 0:
         # Vizinhos disponíveis, mas ainda não conectados, manter ouvindo
@@ -326,11 +346,11 @@ def handle_message(data):
 
         my_udp = address
         my_port = port_received+2
-        threading.Thread(target=start, args=(my_udp,my_port)).start()
+        
         threading.Thread(target=handle_streams, args=(my_udp, my_port)).start()
 
         for neighbor in neighbors_list:
-            threading.Thread(target=handle_connection, args=(neighbor[0], neighbor[1]+1)).start()
+            threading.Thread(target=handle_connection, args=(neighbor[0], neighbor[1]+1, my_udp, my_port)).start()
             
     elif message_code == 2:
         neighbors_list, address_port = data['data']
@@ -342,7 +362,7 @@ def handle_message(data):
         threading.Thread(target=handle_connection_bind, args=(my_udp, my_port)).start()
 
         for neighbor in neighbors_list:
-            threading.Thread(target=handle_connection, args=(neighbor[0], neighbor[1]+1)).start()
+            threading.Thread(target=handle_connection, args=(neighbor[0], neighbor[1]+1, my_udp, my_port)).start()
 
 
 def connect_to_bootstrapper(host, port):
@@ -469,7 +489,7 @@ def handle_connection_bind(host, port):
             while True:
                 
                 option = input()
-
+                global node
                 if option == "1":
                     # Solicitar streams disponíveis
                     sock.settimeout(0.1)  # Set a timeout of 0.5 seconds
@@ -478,7 +498,7 @@ def handle_connection_bind(host, port):
                         try:
                             message = json.dumps({
                                     "code": 1,  # Tipo de mensagem 1
-                                    "sender": "PC1",
+                                    "sender": node,
                                     "destination":"S"
                             })
                             print(f"address{addr}")

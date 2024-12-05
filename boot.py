@@ -9,29 +9,39 @@ import heapq
 
 global_lock = threading.Lock()
 condition = threading.Condition(global_lock)
+
 path_check_lock = threading.Lock()
 path_check_condition = threading.Condition(path_check_lock)
+
 tree_lock = threading.Lock()
 tree_condition = threading.Condition(tree_lock)
+
 start_tree_lock = threading.Lock()
 start_tree_condition = threading.Condition(start_tree_lock)
+
+nodes_connected_lock = threading.Lock()
+nodes_connected_lock_condition = threading.Condition(nodes_connected_lock)
+
+rounting_lock = threading.Lock()
 global boot_name
 
 bootstrapper_name=None
 
 nodes_neighbors = {
     "O2": ["O3","S"],
-    "O3": ["O2", "O4", "O7"],
-    "O4": ["O3", "O5", "O6"],
+    "O3": ["O2", "O4", "O7","O8"],
+    "O4": ["O3", "O5", "O6","O8"],
     "O5": ["O4"],
-    "O6": ["PC1","O4"],
+    "O6": ["PC1","O4","O8"],
     "O7": ["O3", "PC4"],
+    "O8": ["O3","O4","O6"],
     "PC1": ["O6"],
     "PC4": ["O7"],
     "S": ["O2"]
 }
 
 nodes = {
+    "O8" : [("10.0.11.1", 0), ("10.0.10.1", 0), ("10.0.9.2", 0)],
     "O7": [("10.0.21.2", 0), ("10.0.13.1", 0)],
     "O6": [("10.0.22.2", 0), ("10.0.12.1", 0), ("10.0.11.2", 0), ("10.0.14.2", 0), ("10.0.23.1", 0)],
     "O5": [("10.0.16.1", 0), ("10.0.15.2", 0)],
@@ -44,19 +54,21 @@ nodes = {
 }
 
 control = {
+    "O8": (0,[]),
     "O7": (0,[]),
     "O6": (0,[]),
     "O5": (0,[]),
     "O4": (0,[]),
-    "O3": (0,[])
+    "O3": (0,[]),
+    "O2": (0,[])
 }
 
-streams = [] 
 nodes_connected = []
 rtt_weights = {}
 routing_table = {}
 next_hops={}
 servers_socket={}
+count1=0
 
 
 
@@ -131,12 +143,25 @@ def handle_socket_listen(address, port):
                                 else:
                                     print(f"Destino desconhecido: {destination}")
 
+                            elif code == 6:
+                                udp_socket.sendto(b"0", addr)
+                                sender = data_json["sender"]
+                                destination = data_json["destination"]
+                                stream = data_json["stream"]
+
+                                udp_ip, port_ip = next_hops[destination] 
+
+                                threading.Thread(
+                                    target=handle_socket_connect,
+                                    args=(udp_ip, port_ip, sender, destination, 6,None,stream),
+                                    daemon=True
+                                ).start()
+
                     except (UnicodeDecodeError, json.JSONDecodeError):
                         try:
                             # Extraindo as partes do cabeçalho
                             destination = data[:3].decode("utf-8").strip()
                             sender = data[3:6].decode("utf-8").strip()
-                            payload = data[6:]
 
                             next_ip, next_port = next_hops[destination]
 
@@ -169,7 +194,7 @@ def forward_frame(address, port, data):
         udp_socket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         udp_socket.settimeout(1.0)  # Configura timeout para 1 segundo
         udp_socket.connect((address, port))
-
+        
         udp_socket.send(data)
        
 
@@ -190,13 +215,13 @@ def handle_socket_connect(address, port, sender, destination, code, streams=None
         udp_socket.connect((address, port))
         print(f"Conectado ao socket UDP no endereço {address}:{port}")
 
-        # Prepara a mensagem inicial para envio
+        
         message = {
             "code": code,
             "sender": sender,
             "destination": destination
         }
-        if streams:  # Adicionar streams se existirem
+        if streams:
             message["streams"] = streams
 
         if stream:
@@ -301,6 +326,7 @@ def find_best_path(start_node, end_node, parent, distances, graph):
 
 
 def bfs_path_exists(start_node, end_node, graph, nodes_connected):
+
     # Verifica se o nó inicial está na lista dos conectados
     if start_node not in nodes_connected:
         return False
@@ -325,6 +351,8 @@ def check_stream_path():
     pcs = [node for node in nodes if node.startswith("PC")]  # Identifica todos os PCs
     paths_available = {pc: False for pc in pcs}  # Inicia um dicionário para controlar os caminhos disponíveis
 
+    global count1
+
     while True:
         with path_check_condition:
             path_check_condition.wait()  # Espera notificação de nova conexão
@@ -332,7 +360,7 @@ def check_stream_path():
         paths_found_this_round = []
         # Verifica se existe caminho para o servidor "S" de cada PC
         for pc in pcs:
-            if not paths_available[pc] and bfs_path_exists(pc, 'S', nodes_neighbors, nodes_connected):
+            if bfs_path_exists(pc, 'S', nodes_neighbors, nodes_connected):
                 paths_available[pc] = True  # Marca o PC como tendo um caminho disponível
                 paths_found_this_round.append(pc)
 
@@ -352,8 +380,11 @@ def check_stream_path():
                 path, cost = find_best_path("S", pc, parent, distances, rtt_weights)
 
                 if path:
+                    print(f"\n\n\n\n\n{count1}")
                     print(f"Melhor caminho de {pc} para S: {' -> '.join(path)}")
                     print(f"Custo total: {cost:.2f}")
+                    count1+=1
+                    print("\n\n\n\n\n")
 
                     # Determinar e imprimir os caminhos de todos os nós intermediários para S e para PC
                     for i, current_node in enumerate(path):
@@ -361,99 +392,102 @@ def check_stream_path():
                             next_node = path[i + 1]
 
                             # Inicializar a entrada do nó na tabela de roteamento, se ainda não existir
-                            if current_node not in routing_table:
-                                routing_table[current_node] = []
+                            with rounting_lock:
+                                if current_node not in routing_table:
+                                    routing_table[current_node] = []
 
-                            # Verificar se já existe uma entrada com o mesmo `next_hop`
-                            existing_entry = next((entry for entry in routing_table[current_node] if entry["next_hop"] == next_node), None)
+                                # Verificar se já existe uma entrada com o mesmo `next_hop`
+                                existing_entry = next((entry for entry in routing_table[current_node] if entry["next_hop"] == next_node), None)
 
-                            if existing_entry:
-                                # Atualizar a lista de destinos, se o destino atual não estiver presente
-                                if pc not in existing_entry["destinations"]:
-                                    existing_entry["destinations"].append(pc)
-                            else:
-                                # Criar uma nova entrada para o `next_hop` e destino atual
-                                routing_table[current_node].append({"next_hop": next_node, "destinations": [pc]})
+                                if existing_entry:
+                                    # Atualizar a lista de destinos, se o destino atual não estiver presente
+                                    if pc not in existing_entry["destinations"]:
+                                        existing_entry["destinations"].append(pc)
+                                else:
+                                    # Criar uma nova entrada para o `next_hop` e destino atual
+        
+                                        routing_table[current_node].append({"next_hop": next_node, "destinations": [pc]})
 
 
                     print(f"Tabela de roteamento atualizada para {pc}: {routing_table}")
                     nodes_local = [node for node in nodes.keys() if node.startswith("S")]
                     for node in nodes_local:
-                        for key,entries in routing_table.items():
-                            for entry in entries:
-                                # Itera sobre cada dicionário na lista de entradas
-                                destination_nodes = entry["destinations"]  # Extrai os destinos
-                                next_hop = entry["next_hop"]  # Extrai o próximo salto
-                                if key.startswith("S"):
-                                    server=key
-                                if key == node and next_hop.startswith("O"):  # Verifica se o nó atual é o próximo salto
-                                    # Busca a interface (IP e porta) do próximo salto no dicionário de nós
-                                    next_hop_interfaces = nodes.get(next_hop, [])
-                                    next_hop_interface = next((ip, port) for ip, port in next_hop_interfaces if port != 0)
-                                    
-                                    if next_hop_interface:
-                                        next_hop_ip, next_hop_port = next_hop_interface
-                                        message = json.dumps({
-                                            "type": 1,
-                                            "data": {
-                                                "address": next_hop_ip,
-                                                "port": next_hop_port + 5,  # Porta incrementada em 5
-                                                "destinations": [node for node in destination_nodes] 
-                                            }
-                                        })
+                        with rounting_lock:
+                            for key,entries in routing_table.items():
+                                for entry in entries:
+                                    # Itera sobre cada dicionário na lista de entradas
+                                    destination_nodes = entry["destinations"]  # Extrai os destinos
+                                    next_hop = entry["next_hop"]  # Extrai o próximo salto
+                                    if key.startswith("S"):
+                                        server=key
+                                    if key == node and next_hop.startswith("O"):  # Verifica se o nó atual é o próximo salto
+                                        # Busca a interface (IP e porta) do próximo salto no dicionário de nós
+                                        next_hop_interfaces = nodes.get(next_hop, [])
+                                        next_hop_interface = next((ip, port) for ip, port in next_hop_interfaces if port != 0)
                                         
-                                        print(f"Nó {node} enviando mensagem do tipo 1 para próximo salto {next_hop} com destinos {destination_nodes}: {message}")
-                                        servers_socket[node].send(message.encode('utf-8'))
+                                        if next_hop_interface:
+                                            next_hop_ip, next_hop_port = next_hop_interface
+                                            message = json.dumps({
+                                                "type": 1,
+                                                "data": {
+                                                    "address": next_hop_ip,
+                                                    "port": next_hop_port + 5,  # Porta incrementada em 5
+                                                    "destinations": [node for node in destination_nodes] 
+                                                }
+                                            })
+                                            
+                                            print(f"Nó {node} enviando mensagem do tipo 1 para próximo salto {next_hop} com destinos {destination_nodes}: {message}")
+                                            servers_socket[node].send(message.encode('utf-8'))
 
                     node=boot_name
                     server = None
                     if node in routing_table:
-                        
-                        for key, entries in routing_table.items():  # Itera sobre as chaves e valores
-                            for entry in entries: 
-                                 # Itera sobre cada dicionário na lista de entradas
-                                destination_nodes = entry["destinations"]  # Extrai os destinos
-                                next_hop = entry["next_hop"]  # Extrai o próximo salto
-                                if key.startswith("S"):
-                                    server=key
-                                if key == node and next_hop.startswith("O"):  # Verifica se o nó atual é o próximo salto
-                                    # Busca a interface (IP e porta) do próximo salto no dicionário de nós
-                                    next_hop_interfaces = nodes.get(next_hop, [])
-                                    next_hop_interface = next((ip, port) for ip, port in next_hop_interfaces if port != 0)
-                                    
-                                    if next_hop_interface:
-                                        next_hop_ip, next_hop_port = next_hop_interface
-                                        address = next_hop_ip
-                                        port = next_hop_port + 5
-                                        destinations = [node for node in destination_nodes] 
-                                            
-                                        for d in destinations:
-                                            next_hops[d] = (address,port)
-                                            print(f"Destino {d} próximo passo {address} na porta {port}")
-
-                                       
-
-                                if next_hop == node and (key.startswith("O") or key.startswith("S")):  # Verifica se o nó atual é o próximo salto
-                                    # Busca a interface (IP e porta) do próximo salto no dicionário de nós
-                                    key_interfaces = nodes.get(key, [])
-                                    key_interface = next((ip, port) for ip, port in key_interfaces if port != 0)
-
-                                    if key_interface:
-                                        key_ip, key_port = key_interface
+                        with rounting_lock:
+                            for key, entries in routing_table.items():  # Itera sobre as chaves e valores
+                                for entry in entries: 
+                                    # Itera sobre cada dicionário na lista de entradas
+                                    destination_nodes = entry["destinations"]  # Extrai os destinos
+                                    next_hop = entry["next_hop"]  # Extrai o próximo salto
+                                    if key.startswith("S"):
+                                        server=key
+                                    if key == node and next_hop.startswith("O"):  # Verifica se o nó atual é o próximo salto
+                                        # Busca a interface (IP e porta) do próximo salto no dicionário de nós
+                                        next_hop_interfaces = nodes.get(next_hop, [])
+                                        next_hop_interface = next((ip, port) for ip, port in next_hop_interfaces if port != 0)
                                         
-                                        address = key_ip
-                                        if key.startswith("S"):
-                                            port = key_port
-                                        else:
-                                            port = key_port + 6
-                                        destinations= server
-                                        if key.startswith("S"):
-                                            next_hops[destinations] = (address,port)
-                                            print(f"Destino {destinations} próximo passo {address} na porta {port}")
-                                        else:  
+                                        if next_hop_interface:
+                                            next_hop_ip, next_hop_port = next_hop_interface
+                                            address = next_hop_ip
+                                            port = next_hop_port + 5
+                                            destinations = [node for node in destination_nodes] 
+                                                
                                             for d in destinations:
                                                 next_hops[d] = (address,port)
                                                 print(f"Destino {d} próximo passo {address} na porta {port}")
+
+                                        
+
+                                    if next_hop == node and (key.startswith("O") or key.startswith("S")):  # Verifica se o nó atual é o próximo salto
+                                        # Busca a interface (IP e porta) do próximo salto no dicionário de nós
+                                        key_interfaces = nodes.get(key, [])
+                                        key_interface = next((ip, port) for ip, port in key_interfaces if port != 0)
+
+                                        if key_interface:
+                                            key_ip, key_port = key_interface
+                                            
+                                            address = key_ip
+                                            if key.startswith("S"):
+                                                port = key_port
+                                            else:
+                                                port = key_port + 6
+                                            destinations= server
+                                            if key.startswith("S"):
+                                                next_hops[destinations] = (address,port)
+                                                print(f"Destino {destinations} próximo passo {address} na porta {port}")
+                                            else:  
+                                                for d in destinations:
+                                                    next_hops[d] = (address,port)
+                                                    print(f"Destino {d} próximo passo {address} na porta {port}")
                                         
                     with start_tree_lock:
                         start_tree_condition.notify_all()
@@ -480,8 +514,12 @@ def check_stream_path():
                 path, cost = find_best_path("S", pc, parent, distances, rtt_weights)
 
                 if path:
+                    print(f"\n\n\n\n\n")
                     print(f"Melhor caminho de {pc} para S: {' -> '.join(path)}")
                     print(f"Custo total: {cost:.2f}")
+                    count1+=1
+                    print("\n\n\n\n\n")
+
 
                     # Determinar e imprimir os caminhos de todos os nós intermediários para S e para PC
                     for i, current_node in enumerate(path):
@@ -489,98 +527,101 @@ def check_stream_path():
                             next_node = path[i + 1]
 
                             # Inicializar a entrada do nó na tabela de roteamento, se ainda não existir
-                            if current_node not in routing_table:
-                                routing_table[current_node] = []
+                            with rounting_lock:
+                                if current_node not in routing_table:
+                                    routing_table[current_node] = []
 
-                            # Verificar se já existe uma entrada com o mesmo `next_hop`
-                            existing_entry = next((entry for entry in routing_table[current_node] if entry["next_hop"] == next_node), None)
+                                # Verificar se já existe uma entrada com o mesmo `next_hop`
+                                existing_entry = next((entry for entry in routing_table[current_node] if entry["next_hop"] == next_node), None)
 
-                            if existing_entry:
-                                # Atualizar a lista de destinos, se o destino atual não estiver presente
-                                if pc not in existing_entry["destinations"]:
-                                    existing_entry["destinations"].append(pc)
-                            else:
-                                # Criar uma nova entrada para o `next_hop` e destino atual
-                                routing_table[current_node].append({"next_hop": next_node, "destinations": [pc]})
+                                if existing_entry:
+                                    # Atualizar a lista de destinos, se o destino atual não estiver presente
+                                    if pc not in existing_entry["destinations"]:
+                                        existing_entry["destinations"].append(pc)
+                                else:
+                                    # Criar uma nova entrada para o `next_hop` e destino atual
+                                    routing_table[current_node].append({"next_hop": next_node, "destinations": [pc]})
 
                     print(f"Tabela de roteamento atualizada para {pc}: {routing_table}")
 
                     nodes_local = [node for node in nodes.keys() if node.startswith("S")]
                     for node in nodes_local:
-                        for key,entries in routing_table.items():
-                            for entry in entries:
-                                # Itera sobre cada dicionário na lista de entradas
-                                destination_nodes = entry["destinations"]  # Extrai os destinos
-                                next_hop = entry["next_hop"]  # Extrai o próximo salto
-                                if key.startswith("S"):
-                                    server=key
-                                if key == node and next_hop.startswith("O"):  # Verifica se o nó atual é o próximo salto
-                                    # Busca a interface (IP e porta) do próximo salto no dicionário de nós
-                                    next_hop_interfaces = nodes.get(next_hop, [])
-                                    next_hop_interface = next((ip, port) for ip, port in next_hop_interfaces if port != 0)
-                                    
-                                    if next_hop_interface:
-                                        next_hop_ip, next_hop_port = next_hop_interface
-                                        message = json.dumps({
-                                            "type": 1,
-                                            "data": {
-                                                "address": next_hop_ip,
-                                                "port": next_hop_port + 5,  # Porta incrementada em 5
-                                                "destinations": [node for node in destination_nodes] 
-                                            }
-                                        })
+                        with rounting_lock:
+                            for key,entries in routing_table.items():
+                                for entry in entries:
+                                    # Itera sobre cada dicionário na lista de entradas
+                                    destination_nodes = entry["destinations"]  # Extrai os destinos
+                                    next_hop = entry["next_hop"]  # Extrai o próximo salto
+                                    if key.startswith("S"):
+                                        server=key
+                                    if key == node and next_hop.startswith("O"):  # Verifica se o nó atual é o próximo salto
+                                        # Busca a interface (IP e porta) do próximo salto no dicionário de nós
+                                        next_hop_interfaces = nodes.get(next_hop, [])
+                                        next_hop_interface = next((ip, port) for ip, port in next_hop_interfaces if port != 0)
                                         
-                                        print(f"Nó {node} enviando mensagem do tipo 1 para próximo salto {next_hop} com destinos {destination_nodes}: {message}")
-                                        servers_socket[node].send(message.encode('utf-8'))
+                                        if next_hop_interface:
+                                            next_hop_ip, next_hop_port = next_hop_interface
+                                            message = json.dumps({
+                                                "type": 1,
+                                                "data": {
+                                                    "address": next_hop_ip,
+                                                    "port": next_hop_port + 5,  # Porta incrementada em 5
+                                                    "destinations": [node for node in destination_nodes] 
+                                                }
+                                            })
+                                            
+                                            print(f"Nó {node} enviando mensagem do tipo 1 para próximo salto {next_hop} com destinos {destination_nodes}: {message}")
+                                            servers_socket[node].send(message.encode('utf-8'))
     
                     node = boot_name
                     server = None
                     if node in routing_table:
-                        for key, entries in routing_table.items():  # Itera sobre as chaves e valores
-                            for entry in entries:
-                                 # Itera sobre cada dicionário na lista de entradas
-                                destination_nodes = entry["destinations"]  # Extrai os destinos
-                                next_hop = entry["next_hop"]  # Extrai o próximo salto
-                                if key.startswith("S"):
-                                    server=key
-                                if key == node and next_hop.startswith("O"):  # Verifica se o nó atual é o próximo salto
-                                    # Busca a interface (IP e porta) do próximo salto no dicionário de nós
-                                    next_hop_interfaces = nodes.get(next_hop, [])
-                                    next_hop_interface = next((ip, port) for ip, port in next_hop_interfaces if port != 0)
-                                    
-                                    if next_hop_interface:
-                                        next_hop_ip, next_hop_port = next_hop_interface
-                                        address = next_hop_ip
-                                        port = next_hop_port + 5
-                                        destinations = [node for node in destination_nodes] 
-
-                                        for d in destinations:
-                                            next_hops[d] = (address,port)
-                                            print(f"Destino {d} próximo passo {address} na porta {port}")
-
-                                       
-
-                                if next_hop == node and (key.startswith("O") or key.startswith("S")):  # Verifica se o nó atual é o próximo salto
-                                    # Busca a interface (IP e porta) do próximo salto no dicionário de nós
-                                    key_interfaces = nodes.get(key, [])
-                                    key_interface = next((ip, port) for ip, port in key_interfaces if port != 0)
-
-                                    if key_interface:
-                                        key_ip, key_port = key_interface
+                        with rounting_lock:
+                            for key, entries in routing_table.items():  # Itera sobre as chaves e valores
+                                for entry in entries:
+                                    # Itera sobre cada dicionário na lista de entradas
+                                    destination_nodes = entry["destinations"]  # Extrai os destinos
+                                    next_hop = entry["next_hop"]  # Extrai o próximo salto
+                                    if key.startswith("S"):
+                                        server=key
+                                    if key == node and next_hop.startswith("O"):  # Verifica se o nó atual é o próximo salto
+                                        # Busca a interface (IP e porta) do próximo salto no dicionário de nós
+                                        next_hop_interfaces = nodes.get(next_hop, [])
+                                        next_hop_interface = next((ip, port) for ip, port in next_hop_interfaces if port != 0)
                                         
-                                        address = key_ip
-                                        if key.startswith("S"):
-                                            port = key_port
-                                        else:
-                                            port = key_port + 6
-                                        destinations= server
-                                        if key.startswith("S"):
-                                            next_hops[destinations] = (address,port)
-                                            print(f"Destino {destinations} próximo passo {address} na porta {port}")
-                                        else:  
+                                        if next_hop_interface:
+                                            next_hop_ip, next_hop_port = next_hop_interface
+                                            address = next_hop_ip
+                                            port = next_hop_port + 5
+                                            destinations = [node for node in destination_nodes] 
+
                                             for d in destinations:
                                                 next_hops[d] = (address,port)
                                                 print(f"Destino {d} próximo passo {address} na porta {port}")
+
+                                        
+
+                                    if next_hop == node and (key.startswith("O") or key.startswith("S")):  # Verifica se o nó atual é o próximo salto
+                                        # Busca a interface (IP e porta) do próximo salto no dicionário de nós
+                                        key_interfaces = nodes.get(key, [])
+                                        key_interface = next((ip, port) for ip, port in key_interfaces if port != 0)
+
+                                        if key_interface:
+                                            key_ip, key_port = key_interface
+                                            
+                                            address = key_ip
+                                            if key.startswith("S"):
+                                                port = key_port
+                                            else:
+                                                port = key_port + 6
+                                            destinations= server
+                                            if key.startswith("S"):
+                                                next_hops[destinations] = (address,port)
+                                                print(f"Destino {destinations} próximo passo {address} na porta {port}")
+                                            else:  
+                                                for d in destinations:
+                                                    next_hops[d] = (address,port)
+                                                    print(f"Destino {d} próximo passo {address} na porta {port}")
                     with start_tree_lock:
                         start_tree_condition.notify_all()
                 else:
@@ -645,8 +686,9 @@ def update_port(node_name):
     return None
 
 def add_node_to_connected(node):
-    if node not in nodes_connected:
-        nodes_connected.append(node)
+    with nodes_connected_lock:
+        if node not in nodes_connected:
+            nodes_connected.append(node)
         
 
 def handle_node_connection(conn, addr):
@@ -657,181 +699,94 @@ def handle_node_connection(conn, addr):
     try:
         bootneighbor = 0
         if node.startswith("O") or node.startswith("PC"):
-            if node not in nodes_connected or (node in nodes_connected and control[node][0]==1) :
-                add_node_to_connected(node)
-                port = update_port(node)  # Atualiza a porta baseada no nome do nó
+            
+            add_node_to_connected(node)
+            port = update_port(node)  # Atualiza a porta baseada no nome do nó
 
-                # Atualizar as interfaces do próprio nó com a nova porta
-                current_interfaces = nodes.get(node, [])
-                nodes[node] = [(ip, port if ip == addr[0] else old_port) for ip, old_port in current_interfaces]
+            # Atualizar as interfaces do próprio nó com a nova porta
+            current_interfaces = nodes.get(node, [])
+            nodes[node] = [(ip, port if ip == addr[0] else old_port) for ip, old_port in current_interfaces]
 
-                neighbors = nodes_neighbors.get(node, [])
-                selected_interfaces = []
-                count = 0
-                pc = 0
-                pc_interface= []
-                server = None
-                for neighbor in neighbors:
-                    if neighbor.startswith("PC"):
-                            pc = 1
-                    if neighbor in nodes_connected:
-                        if neighbor == boot_name or neighbor.startswith("S"):
-                            if neighbor.startswith("S"):
-                                interfaces = nodes.get(neighbor, [])
-                                if interfaces:
-                                    valid_interfaces = [iface for iface in interfaces if iface[1] != 0]
-                                    if valid_interfaces:
-                                        min_interface = min(valid_interfaces, key=lambda x: x[1])
-                                    else:
-                                        min_interface = min(interfaces, key=lambda x: x[1])
-                                    server = min_interface
-                            count += 1  
-                            # Especial tratamento para O2 como um boot node
-                            # Selecionar uma interface não usada e não hardcoded para O2
-                            """ interfaces = [iface for iface in nodes.get("O2", []) if iface[1] == 0 and iface != ("10.0.11.1", 5001)]
+            neighbors = nodes_neighbors.get(node, [])
+            selected_interfaces = []
+            count = 0
+            pc = 0
+            pc_interface= []
+            server = None
+            for neighbor in neighbors:
+                if neighbor.startswith("PC"):
+                        pc = 1
+                if neighbor in nodes_connected:
+                    if neighbor == boot_name or neighbor.startswith("S"):
+                        if neighbor.startswith("S"):
+                            interfaces = nodes.get(neighbor, [])
                             if interfaces:
-                                new_port = update_port("O2") + 1
-                                selected_interface = min(interfaces, key=lambda x: x[1])  # escolher a interface com menor valor de porta
-                                selected_interfaces.append((selected_interface[0], new_port))
-                                # Criar uma thread para ouvir conexões nessa nova porta
-                                threading.Thread(target=neighbours_connections, args=(selected_interface[0], new_port)).start() """
-                        else:
-                            if neighbor.startswith("PC"):
-                                count += 1
-                                interfaces = nodes.get(neighbor, [])
-                                if interfaces:
-                                    valid_interfaces = [iface for iface in interfaces if iface[1] != 0]
-                                    if valid_interfaces:
-                                        min_interface = min(valid_interfaces, key=lambda x: x[1])
-                                    else:
-                                        min_interface = min(interfaces, key=lambda x: x[1])
-                                    pc_interface.append(min_interface)
-                            else: 
-                                count += 1
-                                interfaces = nodes.get(neighbor, [])
-                                if interfaces:
-                                    valid_interfaces = [iface for iface in interfaces if iface[1] != 0]
-                                    if valid_interfaces:
-                                        min_interface = min(valid_interfaces, key=lambda x: x[1])
-                                    else:
-                                        min_interface = min(interfaces, key=lambda x: x[1])
-                                    selected_interfaces.append(min_interface)
-
-                if len(selected_interfaces) == 0 :
-                    data_to_send = [addr[0], port]
-                    message_code = 0
-                elif count == len(neighbors) and not node.startswith("PC"):  
-                    data_to_send = selected_interfaces
-                    message_code = 1
-                elif count == len(neighbors) and node.startswith("PC"):  
-                    data_to_send = [selected_interfaces, [addr[0], port]]
-                    message_code = 1
-                else:
-                    data_to_send = [selected_interfaces, [addr[0], port]]
-                    message_code = 2
-                if bootstrapper_name in nodes_neighbors and node in nodes_neighbors[bootstrapper_name]:
-                    if node != "S": 
-                        bootneighbor = 1
-
-                my_udp = [addr[0], port+5]
-                control[node]=(message_code,selected_interfaces)
-                
-                
-                complete_message = json.dumps({"code": message_code, "bootneighbor":bootneighbor ,"node": node ,"data": data_to_send, "pc": pc, "pc_interface": pc_interface, "my_udp": my_udp, "server":server})
-                print(f"Message sent to {addr[0]}")
-                conn.send(complete_message.encode('utf-8'))
-
-            else:
-                pc=0
-                add_node_to_connected(node)
-                pc_interface = []
-                port = update_port(node)  # Atualiza a porta baseada no nome do nó
-                my_udp=None
-                server=None
-                if control[node][0]==0:
-                    data_to_send = [addr[0], port]
-                    message_code = 0
-                
-                else:
-                                
-                    # Atualizar as interfaces do próprio nó com a nova porta
-                    current_interfaces = nodes.get(node, [])
-                    nodes[node] = [(ip, port if ip == addr[0] else old_port) for ip, old_port in current_interfaces]
-
-                    neighbors = nodes_neighbors.get(node, [])
-                    selected_interfaces = []
-                    count = 0
-                    pc = 0
-                    pc_interface = []
-                    for neighbor in neighbors:
-                        if neighbor.startswith("PC"):
-                            pc = 1
-                        if neighbor in nodes_connected:
-                            if neighbor == boot_name or neighbor.startswith("S"):
-                                if neighbor.startswith("S"):
-                                    interfaces = nodes.get(neighbor, [])
-                                    if interfaces:
-                                        valid_interfaces = [iface for iface in interfaces if iface[1] != 0]
-                                        if valid_interfaces:
-                                            min_interface = min(valid_interfaces, key=lambda x: x[1])
-                                        else:
-                                            min_interface = min(interfaces, key=lambda x: x[1])
-                                        server = min_interface
-                                count += 1
-                                # Especial tratamento para O2 como um boot node
-                                # Selecionar uma interface não usada e não hardcoded para O2
-                                """ interfaces = [iface for iface in nodes.get("O2", []) if iface[1] == 0 and iface != ("10.0.11.1", 5001)]
-                                if interfaces:
-                                    new_port = update_port("O2") + 1
-                                    selected_interface = min(interfaces, key=lambda x: x[1])  # escolher a interface com menor valor de porta
-                                    selected_interfaces.append((selected_interface[0], new_port))
-                                    # Criar uma thread para ouvir conexões nessa nova porta
-                                    threading.Thread(target=neighbours_connections, args=(selected_interface[0], new_port)).start() """
-                            else:
-                                if neighbor.startswith("PC"):
-                                    count += 1
-                                    interfaces = nodes.get(neighbor, [])
-                                    if interfaces:
-                                        valid_interfaces = [iface for iface in interfaces if iface[1] != 0]
-                                        if valid_interfaces:
-                                            min_interface = min(valid_interfaces, key=lambda x: x[1])
-                                        else:
-                                            min_interface = min(interfaces, key=lambda x: x[1])
-                                        pc_interface.append(min_interface)
-                                else: 
-                                    count += 1
-                                    interfaces = nodes.get(neighbor, [])
-                                    if interfaces:
-                                        valid_interfaces = [iface for iface in interfaces if iface[1] != 0]
-                                        if valid_interfaces:
-                                            min_interface = min(valid_interfaces, key=lambda x: x[1])
-                                        else:
-                                            min_interface = min(interfaces, key=lambda x: x[1])
-                                        selected_interfaces.append(min_interface)
-
-                    if len(selected_interfaces) == 0 :
-                        data_to_send = [addr[0], port]
-                        message_code = 0
-                    elif count == len(neighbors) and not node.startswith("PC"):  
-                        data_to_send = selected_interfaces
-                        message_code = 1
-                    elif count == len(neighbors) and node.startswith("PC"):  
-                        data_to_send = [selected_interfaces, [addr[0], port]]
-                        message_code = 1
+                                valid_interfaces = [iface for iface in interfaces if iface[1] != 0]
+                                if valid_interfaces:
+                                    min_interface = min(valid_interfaces, key=lambda x: x[1])
+                                else:
+                                    min_interface = min(interfaces, key=lambda x: x[1])
+                                server = min_interface
+                        count += 1  
                     else:
-                        data_to_send = [selected_interfaces, [addr[0], port]]
-                        message_code = 2
-                    if bootstrapper_name in nodes_neighbors and node in nodes_neighbors[bootstrapper_name]:
-                        if node != "S": 
-                            bootneighbor = 1
+                        if neighbor.startswith("PC"):
+                            count += 1
+                            interfaces = nodes.get(neighbor, [])
+                            if interfaces:
+                                valid_interfaces = [iface for iface in interfaces if iface[1] != 0]
+                                if valid_interfaces:
+                                    min_interface = min(valid_interfaces, key=lambda x: x[1])
+                                else:
+                                    min_interface = min(interfaces, key=lambda x: x[1])
+                                pc_interface.append(min_interface)
+                        else: 
+                            count += 1
+                            interfaces = nodes.get(neighbor, [])
+                            if interfaces:
+                                valid_interfaces = [iface for iface in interfaces if iface[1] != 0]
+                                if valid_interfaces:
+                                    min_interface = min(valid_interfaces, key=lambda x: x[1])
+                                else:
+                                    min_interface = min(interfaces, key=lambda x: x[1])
+                                selected_interfaces.append(min_interface)
 
-                    control[node]=(message_code,selected_interfaces)
-                    my_udp = [addr[0], port+5]
-                    
+            if len(selected_interfaces) == 0 :
+                data_to_send = [addr[0], port]
+                message_code = 0
+            elif count == len(neighbors) and not node.startswith("PC"):  
+                data_to_send = selected_interfaces
+                message_code = 1
+            elif count == len(neighbors) and node.startswith("PC"):  
+                data_to_send = [selected_interfaces, [addr[0], port]]
+                message_code = 1
+            else:
+                data_to_send = [selected_interfaces, [addr[0], port]]
+                message_code = 2
+            if bootstrapper_name in nodes_neighbors and node in nodes_neighbors[bootstrapper_name]:
+                if node != "S": 
+                    bootneighbor = 1
 
-                complete_message = json.dumps({"code": message_code, "bootneighbor":bootneighbor ,"node": node ,"data": data_to_send, "pc": pc, "pc_interface": pc_interface, "my_udp": my_udp, "server":server})
-                conn.send(complete_message.encode('utf-8'))
+            my_udp = [addr[0], port+5]
+            control[node]=(message_code,selected_interfaces)
+            
+            
+            message = json.dumps({
+                "code": message_code,
+                "bootneighbor": bootneighbor,
+                "node": node,
+                "data": data_to_send,
+                "pc": pc,
+                "pc_interface": pc_interface,
+                "my_udp": my_udp,
+                "server": server
+            })
 
+            print(f"MENSAGEMMM {message}")
+            
+            try:
+                conn.send(message.encode('utf-8'))
+            except (BrokenPipeError, ConnectionResetError) as e:
+                pass
             try:
                 # Recebe a mensagem do nó
                 data = conn.recv(1024)
@@ -924,82 +879,136 @@ def handle_node_connection(conn, addr):
             except Exception as e:
                 print(f"Erro ao processar mensagem RTT: {e}")
 
+        threading.Thread(target=listen_to_client, args=(conn, addr, node), daemon=True).start()
+
         node = find_ip(addr[0])
         while True:
             with start_tree_lock:
                 start_tree_condition.wait()
-                #print(f"TABELA DE ROUTING: {routing_table}")
 
                 node = find_ip(addr[0])
                 server = None
-                if node in routing_table:
-                    for key, entries in routing_table.items():  # Itera sobre as chaves e valores
-                        for entry in entries:  # Itera sobre cada dicionário na lista de entradas
-                            destination_nodes = entry["destinations"]  # Extrai os destinos
-                            next_hop = entry["next_hop"]  # Extrai o próximo salto
-                            if key.startswith("S"):
-                                server=key
-                            if key == node and (next_hop.startswith("O") or next_hop.startswith("PC")):  # Verifica se o nó atual é o próximo salto
-                                # Busca a interface (IP e porta) do próximo salto no dicionário de nós
-                                next_hop_interfaces = nodes.get(next_hop, [])
-                                next_hop_interface = next((ip, port) for ip, port in next_hop_interfaces if port != 0)
+                with rounting_lock:
+                    if node in routing_table:
+                        for key, entries in routing_table.items():  # Itera sobre as chaves e valores
+                            for entry in entries:
+                                #print(F"\n\n\nENTRYYYY: {key} {entry}")  # Itera sobre cada dicionário na lista de entradas
+                                destination_nodes = entry["destinations"]  # Extrai os destinos
+                                next_hop = entry["next_hop"]  # Extrai o próximo salto
+                                if key.startswith("S"):
+                                    server=key
+                                if key == node and (next_hop.startswith("O") or next_hop.startswith("PC")):  # Verifica se o nó atual é o próximo salto
+                                    # Busca a interface (IP e porta) do próximo salto no dicionário de nós
+                                    next_hop_interfaces = nodes.get(next_hop, [])
+                                    next_hop_interface = next((ip, port) for ip, port in next_hop_interfaces if port != 0)
 
-                                if next_hop_interface:
-                                    next_hop_ip, next_hop_port = next_hop_interface
-                                    if next_hop.startswith("PC"):
-                                        message = json.dumps({
-                                            "type": 1,  # Tipo de mensagem 1
-                                            "data": {
-                                                "address": next_hop_ip,
-                                                "port": next_hop_port+2,  # Porta incrementada em 2
-                                                "destinations": [node for node in destination_nodes] 
-                                            }
-                                        })
-                                    else:
-                                        message = json.dumps({
-                                            "type": 1,  # Tipo de mensagem 1
-                                            "data": {
-                                                "address": next_hop_ip,
-                                                "port": next_hop_port + 5,  # Porta incrementada em 5
-                                                "destinations": [node for node in destination_nodes] 
-                                            }
-                                        })
-                                    
-                                    print(f"Nó {node} enviando mensagem do tipo 1 para próximo salto {next_hop} com destinos {destination_nodes}: {message}")
-                                    conn.send(message.encode('utf-8'))
+                                    if next_hop_interface:
+                                        next_hop_ip, next_hop_port = next_hop_interface
+                                        if next_hop.startswith("PC"):
+                                            message = json.dumps({
+                                                "type": 1,  # Tipo de mensagem 1
+                                                "data": {
+                                                    "address": next_hop_ip,
+                                                    "port": next_hop_port+2,  # Porta incrementada em 2
+                                                    "destinations": [node for node in destination_nodes] 
+                                                }
+                                            })
+                                        else:
+                                            message = json.dumps({
+                                                "type": 1,  # Tipo de mensagem 1
+                                                "data": {
+                                                    "address": next_hop_ip,
+                                                    "port": next_hop_port + 5,  # Porta incrementada em 5
+                                                    "destinations": [node for node in destination_nodes] 
+                                                }
+                                            })
+                                        
+                                        print(f"Nó {node} enviando mensagem do tipo 1 para próximo salto {next_hop} com destinos {destination_nodes}: {message}")
+                                        try:
+                                            conn.send(message.encode('utf-8'))
+                                        except (BrokenPipeError, ConnectionResetError) as e:
+                                            pass
 
-                            if next_hop == node and (key.startswith("O") or key.startswith("S")):  # Verifica se o nó atual é o próximo salto
-                                # Busca a interface (IP e porta) do próximo salto no dicionário de nós
-                                key_interfaces = nodes.get(key, [])
-                                key_interface = next((ip, port) for ip, port in key_interfaces if port != 0)
+                                if next_hop == node and (key.startswith("O") or key.startswith("S")):  # Verifica se o nó atual é o próximo salto
+                                    # Busca a interface (IP e porta) do próximo salto no dicionário de nós
+                                    key_interfaces = nodes.get(key, [])
+                                    key_interface = next((ip, port) for ip, port in key_interfaces if port != 0)
 
-                                if key_interface:
-                                    key_ip, key_port = key_interface
-                                    if (key.startswith("S")):
-                                        message = json.dumps({
-                                            "type": 2,  # Tipo de mensagem 2
-                                            "data": {
-                                                "address": key_ip,
-                                                "port": key_port,  # Porta incrementada em 5
-                                                "destinations": server
-                                            }
-                                        })
-                                    else:
-                                        message = json.dumps({
-                                            "type": 2,  # Tipo de mensagem 2
-                                            "data": {
-                                                "address": key_ip,
-                                                "port": key_port + 6,  # Porta incrementada em 5
-                                                "destinations": server
-                                            }
-                                        })
-                                    
-                                    print(f"Nó {node} enviando mensagem do tipo 2 para próximo salto {next_hop} com destinos {destination_nodes}: {message}")
-                                    conn.send(message.encode('utf-8'))
-
+                                    if key_interface:
+                                        key_ip, key_port = key_interface
+                                        if (key.startswith("S")):
+                                            message = json.dumps({
+                                                "type": 2,  # Tipo de mensagem 2
+                                                "data": {
+                                                    "address": key_ip,
+                                                    "port": key_port,  # Porta incrementada em 5
+                                                    "destinations": server
+                                                }
+                                            })
+                                        else:
+                                            message = json.dumps({
+                                                "type": 2,  # Tipo de mensagem 2
+                                                "data": {
+                                                    "address": key_ip,
+                                                    "port": key_port + 6,  # Porta incrementada em 5
+                                                    "destinations": server
+                                                }
+                                            })
+                                        
+                                        print(f"Nó {node} enviando mensagem do tipo 2 para próximo salto {next_hop} com destinos {destination_nodes}: {message}")
+                                        try:
+                                            conn.send(message.encode('utf-8'))
+                                        except (BrokenPipeError, ConnectionResetError) as e:
+                                            pass
     finally:
         conn.close()
         print(f"Conexão com {addr} encerrada.")
+
+def listen_to_client(conn, addr, node):
+    """
+    Thread separada para escutar mensagens recebidas do cliente e notificar o bootstrapper em caso de mensagem de desconexão.
+    """
+    global dead_clients
+    try:
+        while True:
+            try:
+                data = conn.recv(1024)
+                if not data:
+                    print(f"Cliente {addr} desconectado.")
+                    break
+                message = json.loads(data.decode('utf-8'))
+        
+                if message.get("code") == 5:
+                    node_sender = message.get("node")
+                    dead_node = message.get("dead_client")
+                    print(f"Mensagem de desconexão recebida do cliente {node}: Cliente {dead_node} morto!")
+
+                    node_name=find_ip(dead_node)
+                    
+                    with nodes_connected_lock:
+                        with global_lock:
+                            if node_name in nodes_connected:
+                                for origin_node, destinations in rtt_weights.items():
+                                    # Se o node_name for destino de origin_node, define latência como inf
+                                    if node_name in destinations:
+                                        rtt_weights[origin_node][node_name] = float('inf')
+                                
+                                # Se o node_name for origem, define todas as suas latências para inf
+                                if node_name in rtt_weights:
+                                    for destination_node in rtt_weights[node_name]:
+                                        rtt_weights[node_name][destination_node] = float('inf')
+                                nodes_connected.remove(node_name)
+                                with path_check_lock:
+                                    path_check_condition.notifyAll()
+                else:
+                    print(f"Mensagem desconhecida de {node}: {message}")
+
+            except json.JSONDecodeError:
+                print(f"Mensagem inválida recebida de {addr}: {data}")
+            except Exception as e:
+                print(f"Erro ao processar mensagem de {node}: {e}")
+    finally:
+        print(f"Encerrando thread de escuta para {node}.")
 
 
 def initialize_rtt_weights():
@@ -1009,20 +1018,20 @@ def initialize_rtt_weights():
     """
     global rtt_weights
 
-    # Inicializa todos os nós no rtt_weights
-    for node in nodes_neighbors:
-        if node not in rtt_weights:
-            rtt_weights[node] = {}
-        for neighbor in nodes_neighbors[node]:
-            # Garante que o vizinho também esteja no dicionário
-            if neighbor not in rtt_weights:
-                rtt_weights[neighbor] = {}
+    with global_lock:
+        for node in nodes_neighbors:
+            if node not in rtt_weights:
+                rtt_weights[node] = {}
+            for neighbor in nodes_neighbors[node]:
+                # Garante que o vizinho também esteja no dicionário
+                if neighbor not in rtt_weights:
+                    rtt_weights[neighbor] = {}
 
-            # Define pesos infinitos bidirecionais
-            if neighbor not in rtt_weights[node]:
-                rtt_weights[node][neighbor] = float('inf')
-            if node not in rtt_weights[neighbor]:
-                rtt_weights[neighbor][node] = float('inf')
+                # Define pesos infinitos bidirecionais
+                if neighbor not in rtt_weights[node]:
+                    rtt_weights[node][neighbor] = float('inf')
+                if node not in rtt_weights[neighbor]:
+                    rtt_weights[neighbor][node] = float('inf')
         
 
 def start_bootstrapper(host, port):
@@ -1031,7 +1040,7 @@ def start_bootstrapper(host, port):
         s.bind((host, port))
         s.listen()
         print(f"Bootstrapper started at {host}:{port}, waiting for node connections...")
-        nodes_connected.append("S")
+
         node = find_ip(host)
         if node in nodes:
             updated_list = []
@@ -1046,7 +1055,10 @@ def start_bootstrapper(host, port):
         nodes[node] = updated_list
         global boot_name
         boot_name = node
-        nodes_connected.append(node)
+
+        with nodes_connected_lock:
+            nodes_connected.append(node)
+
         threading.Thread(target=handle_socket_listen, args=(host, port+5)).start()
         threading.Thread(target=handle_socket_listen, args=(host, port+6)).start()
 
@@ -1062,19 +1074,7 @@ def server_con(server_host, server_port, bootstrapper_host):
     encerra a conexão e calcula o RTT via UDP.
     """
     try:
-        # Criar uma conexão TCP inicial para obter informações
-        tcp_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        tcp_socket.connect((server_host, server_port))
-        print(f"Connected to server at {server_host}:{server_port} via TCP")
-
-        response = tcp_socket.recv(1024).decode()
-        streams.extend(response.split(","))
-        print(f"Available streams received: {response}")
-
-        # Encerra a conexão TCP
-        tcp_socket.close()
         
-
         # Inicia a conexão UDP para calcular RTT
         udp_socket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         udp_socket.settimeout(2)  # Define o timeout de 5 segundos
@@ -1122,7 +1122,7 @@ def server_con(server_host, server_port, bootstrapper_host):
                 continue
     except Exception as e:
         print(f"Error in server_con: {e}")
-
+    
 
 def has_neighbor_starting_with_s(node, nodes_neighbors):
     neighbors = nodes_neighbors.get(node, [])
@@ -1156,6 +1156,9 @@ if __name__ == "__main__":
         sys.exit(1)
     
     server = find_ip(server_ip) 
+
+    with nodes_connected_lock:
+        nodes_connected.append(server)
     server_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     server_socket.connect((server_ip, server_port))
     print(f"Connected to server at {server_ip}:{server_port} via TCP")
@@ -1168,6 +1171,7 @@ if __name__ == "__main__":
 
     # start the bootstrapper to handle node connections
     threading.Thread(target=start_bootstrapper, args=(bootstrapper_host, bootstrapper_port), daemon=True).start()
+    
 
     threading.Thread(target=check_stream_path, daemon=True).start()
     
